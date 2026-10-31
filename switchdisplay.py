@@ -377,27 +377,39 @@ class Clicker:
         return 200, {"ok": True, "click": self.last_click, "command": " ".join(argv)}
 
 
+class JpegStreamSplitter:
+    """Incrementally split a concatenated JPEG stream at SOI/EOI markers."""
+
+    def __init__(self, max_buffer: int = 8 * 1024 * 1024):
+        self.max_buffer = max_buffer
+        self.buf = bytearray()
+
+    def feed(self, chunk: bytes):
+        self.buf.extend(chunk)
+        if len(self.buf) > self.max_buffer:
+            del self.buf[:]
+            return
+        while True:
+            start = self.buf.find(b"\xff\xd8")
+            if start < 0:
+                if len(self.buf) > 1:
+                    del self.buf[:-1]
+                return
+            if start:
+                del self.buf[:start]
+            end = self.buf.find(b"\xff\xd9", 2)
+            if end < 0:
+                return
+            frame = bytes(self.buf[:end + 2])
+            del self.buf[:end + 2]
+            yield frame
+
+
 def split_jpeg_stream(chunks, max_buffer: int = 8 * 1024 * 1024):
     """Yield complete JPEGs from arbitrary chunks of a concatenated stream."""
-    buf = bytearray()
+    splitter = JpegStreamSplitter(max_buffer)
     for chunk in chunks:
-        buf.extend(chunk)
-        if len(buf) > max_buffer:
-            del buf[:]
-            continue
-        while True:
-            start = buf.find(b"\xff\xd8")
-            if start < 0:
-                if len(buf) > 1:
-                    del buf[:-1]
-                break
-            if start:
-                del buf[:start]
-            end = buf.find(b"\xff\xd9", 2)
-            if end < 0:
-                break
-            yield bytes(buf[:end + 2])
-            del buf[:end + 2]
+        yield from splitter.feed(chunk)
 
 
 class Hub:
@@ -434,7 +446,7 @@ class Hub:
         memory without bound.
         """
         assert self.proc and self.proc.stdout
-        buf = bytearray()
+        splitter = JpegStreamSplitter()
         while True:
             # read1 returns whatever is available: read(n) would block until the
             # full 64 KB fills, which throttles a 20 fps stream to a few fps
@@ -442,24 +454,7 @@ class Hub:
             chunk = self.proc.stdout.read1(65536)
             if not chunk:
                 break
-            buf.extend(chunk)
-            if len(buf) > 8 * 1024 * 1024:
-                self.stderr_tail.append("frame splitter buffer exceeded 8 MiB; reset")
-                del buf[:]
-                continue
-            while True:
-                start = buf.find(b"\xff\xd8")
-                if start < 0:
-                    if len(buf) > 1:
-                        del buf[:-1]
-                    break
-                if start:
-                    del buf[:start]
-                end = buf.find(b"\xff\xd9", 2)
-                if end < 0:
-                    break
-                frame = bytes(buf[:end + 2])
-                del buf[:end + 2]
+            for frame in splitter.feed(chunk):
                 self._publish(frame)
         if self.proc and self.proc.returncode is None:
             self.proc.poll()
@@ -899,9 +894,7 @@ def main() -> int:
     if clicker and args.bind == "0.0.0.0":
         args.bind = lan_ip
         print(f"[http] click enabled; binding to LAN IP {lan_ip} instead of 0.0.0.0", flush=True)
-    allowed_hosts = {"localhost", "127.0.0.1", "conntest.nintendowifi.net",
-                     "ctest.cdn.nintendo.net", lan_ip, args.bind}
-    allowed_hosts.update(h.lower().split(":", 1)[0] for h in args.allow_host)
+    allowed_hosts = _allowed_hosts(args.bind, lan_ip, args.allow_host)
     dns_sock = None
     if args.dns_port:
         answer = args.dns_answer or lan_ip
@@ -957,6 +950,16 @@ def _lan_ip() -> str:
         return "127.0.0.1"
     finally:
         s.close()
+
+
+def _allowed_hosts(bind: str, lan_ip: str, allow_hosts: list[str]) -> set[str]:
+    """Build Host values, replacing wildcard binds with the effective LAN IP."""
+    hosts = {"localhost", "127.0.0.1", "conntest.nintendowifi.net",
+             "ctest.cdn.nintendo.net", lan_ip.lower()}
+    if bind not in ("0.0.0.0", "::"):
+        hosts.add(bind.lower())
+    hosts.update(h.lower().split(":", 1)[0] for h in allow_hosts)
+    return hosts
 
 
 if __name__ == "__main__":

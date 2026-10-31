@@ -34,6 +34,12 @@ class Tests(unittest.TestCase):
         frames = list(switchdisplay.split_jpeg_stream([b"junk\xff", b"\xd8one\xff\xd9\xff\xd8two", b"\xff\xd9"]))
         self.assertEqual(frames, [b"\xff\xd8one\xff\xd9", b"\xff\xd8two\xff\xd9"])
 
+    def test_incremental_frame_splitter_awkward_chunks(self):
+        splitter = switchdisplay.JpegStreamSplitter()
+        chunks = [b"junk\xff", b"\xd8first\xff", b"\xd9\xff\xd8se", b"cond\xff\xd9"]
+        frames = [frame for chunk in chunks for frame in splitter.feed(chunk)]
+        self.assertEqual(frames, [b"\xff\xd8first\xff\xd9", b"\xff\xd8second\xff\xd9"])
+
     def test_dns_answer(self):
         name = b"\x08conntest\x0cnintendowifi\x03net\x00"
         packet = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + name + b"\x00\x01\x00\x01"
@@ -70,6 +76,12 @@ class Tests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_wildcard_bind_allows_lan_ip_without_wildcard_literal(self):
+        hosts = switchdisplay._allowed_hosts("0.0.0.0", "192.0.2.9", [])
+        self.assertIn("192.0.2.9", hosts)
+        self.assertNotIn("0.0.0.0", hosts)
+        self.assertNotIn("::", switchdisplay._allowed_hosts("::", "192.0.2.9", []))
 
 
 if __name__ == "__main__":
