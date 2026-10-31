@@ -93,6 +93,27 @@ Presets: `test` (built-in pattern, default), `mac-mirror`, `mac-extended`,
 `x11`. `--print-source` prints the resolved ffmpeg argv without starting the
 server — use it to confirm the capture line before running.
 
+### Streaming efficiency profiles
+
+Use `--profile sharp|balanced|low` for 1280×720, 960×540, or 800×450. The
+default remains each preset's existing size; explicit `--width`/`--height`
+always override a profile. Presets use JPEG `yuvj420p` with optimal Huffman
+tables and a `fast_bilinear` scaler (where scaling is present). On the local
+test source, optimal Huffman reduced frame bytes by about 25% and
+`fast_bilinear` reduced encoder CPU by about 22% (machine/source dependent).
+
+`--static` is opt-in for presets and adds `mpdecimate,setpts=N/FRAME_RATE/TB`
+after scaling, so unchanged screens can stop producing frames. The server
+keeps MJPEG and WebSocket connections alive with keepalives and the viewer
+does not reconnect merely because a frame is unchanged. Custom `--source`
+commands are intentionally untouched; add those filters yourself if needed.
+
+The viewer supports `?mode=canvas` (default WebSocket canvas), `?mode=img`
+(WebSocket image), `?mode=mjpeg` (native multipart image), and `?mode=pull`
+(client-pull WebSocket flow control). For example:
+`http://host:8090/?mode=img` and `http://host:8090/?mode=pull`. The HUD shows
+the selected mode and measured render fps for A/B comparisons on the Switch.
+
 Endpoints: `/` viewer page, `/ws` binary JPEG WebSocket, `/mjpeg` MJPEG
 fallback, `POST /click` (tap-to-click), `/health` counters.
 

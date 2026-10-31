@@ -38,6 +38,7 @@ import sys
 import threading
 import time
 import signal
+import select
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -73,8 +74,7 @@ VIEWER_HTML = b"""<!doctype html>
   window.__taps = 0;
   window.__mode = 'none';
 
-  // -- object-fit is not available on the Switch's WebKit (Safari 9 class):
-  //    letterbox manually so a 960x540 frame fills the screen undistorted.
+  // -- Letterbox manually for the Switch's Safari 9-class WebKit.
   var mediaEl = null;
   function fit() {
     if (!mediaEl) return;
@@ -99,38 +99,36 @@ VIEWER_HTML = b"""<!doctype html>
   }
   window.setInterval(hudUpdate, 500);
 
-  // ---- MJPEG fallback: an <img> needs nothing but image decoding ----
+  function queryMode() {
+    var q = location.search.substring(1).split('&'), i, p;
+    for (i = 0; i < q.length; i++) { p = q[i].split('=');
+      if (p[0] === 'mode' && /^(canvas|img|mjpeg|pull)$/.test(p[1])) return p[1]; }
+    return 'canvas';
+  }
+  var wantedMode = queryMode();
   function mjpegFallback() {
     if (window.__mode === 'mjpeg') return;
     window.__mode = 'mjpeg';
-    var img = document.createElement('img');
-    var stall;
+    var img = document.createElement('img'), stall, last = new Date().getTime();
     mediaEl = img;
-    function restart() {
-      img.src = '/mjpeg?' + (new Date().getTime());
-      window.clearTimeout(stall);
-      stall = window.setTimeout(restart, 8000);
-    }
-    img.onload = function () { frames++; window.__frames++; fit(); restart(); };
-    img.onerror = restart;
-    restart();
-    document.getElementById('wrap').appendChild(img);
+    function restart() { img.src = '/mjpeg?' + (new Date().getTime());
+      window.clearTimeout(stall); stall = window.setTimeout(restart, 10000); }
+    img.onload = function () { frames++; window.__frames++; last = new Date().getTime(); fit(); };
+    img.onerror = restart; restart(); document.getElementById('wrap').appendChild(img);
     canvas.style.display = 'none';
-    hud.textContent = 'mjpeg';
   }
-
-  if (!window.WebSocket) { mjpegFallback(); } else {
-    // ---- WebSocket + canvas: the standard live-frame pattern ----
+  if (wantedMode === 'mjpeg' || !window.WebSocket) { mjpegFallback(); } else {
     (function connect() {
       var ws;
       var gotMessage = false;
       var attempts = window.__wsAttempts || 0;
       window.__wsAttempts = attempts + 1;
       try { ws = new WebSocket(url); } catch (e) { mjpegFallback(); return; }
-      window.__mode = 'ws';
-      ws.binaryType = 'arraybuffer';
-      ws.onopen = function () { hud.textContent = 'ws open'; };
-      ws.onmessage = function (ev) {
+       window.__mode = wantedMode === 'pull' ? 'pull' : wantedMode;
+       ws.binaryType = 'arraybuffer';
+       ws.onopen = function () { hud.textContent = window.__mode + ' open';
+         if (wantedMode === 'pull') ws.send('pull'); };
+       ws.onmessage = function (ev) {
         gotMessage = true;
         frames++;
         if (window.__decoding) {
@@ -139,20 +137,31 @@ VIEWER_HTML = b"""<!doctype html>
         }
         decode(ev.data);
       };
-      function decode(data) {
+       function decode(data) {
         window.__decoding = true;
         var blob = new Blob([data], { type: 'image/jpeg' });
         var u = window.URL.createObjectURL(blob);
         var img = new Image();
         img.onload = function () {
-          if (canvas.width !== img.width || canvas.height !== img.height) {
+           if (wantedMode === 'img' || wantedMode === 'pull') {
+             var old = mediaEl, shown = img;
+             shown.style.display = 'block';
+             document.getElementById('wrap').appendChild(shown);
+             canvas.style.display = 'none';
+             shown.width = img.width; shown.height = img.height;
+             mediaEl = shown; fit();
+             if (old && old !== canvas && old !== shown) { if (old.__url) window.URL.revokeObjectURL(old.__url);
+               if (old.parentNode) old.parentNode.removeChild(old); }
+             shown.__url = u;
+           } else if (canvas.width !== img.width || canvas.height !== img.height) {
             canvas.width = img.width; canvas.height = img.height;
           }
           ctx.drawImage(img, 0, 0);
-          window.URL.revokeObjectURL(u);
+           if (wantedMode !== 'img' && wantedMode !== 'pull') window.URL.revokeObjectURL(u);
            mediaEl = canvas;
            fit();
            window.__frames++;
+           if (wantedMode === 'pull' && ws.readyState === 1) ws.send('n');
            window.__decoding = false;
            if (window.__pending) { var next = window.__pending; window.__pending = null; decode(next); }
          };
@@ -162,7 +171,7 @@ VIEWER_HTML = b"""<!doctype html>
          };
          img.src = u;
       }
-      ws.onclose = function () {
+       ws.onclose = function () {
         if (!gotMessage && attempts >= 3) { mjpegFallback(); return; }
         hud.textContent = 'reconnecting...';
         window.setTimeout(connect, 1000);
@@ -420,11 +429,12 @@ class Hub:
         self.latest: bytes | None = None
         self.frame_size: tuple[int, int] | None = None
         self.lock = threading.Lock()
-        self.clients: set[queue.Queue] = set()
+        self.clients: set[Client] = set()
         self.frames = 0
         self.proc: subprocess.Popen | None = None
         self.stderr_tail: list[str] = []
         self.started = time.time()
+        self.frame_id = 0
 
     def start(self) -> None:
         self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -467,22 +477,28 @@ class Hub:
             self.latest = frame
             self.frame_size = jpeg_size(frame) or self.frame_size
             self.frames += 1
+            self.frame_id += 1
             clients = list(self.clients)
-        for q in clients:
+        for client in clients:
             try:
-                q.put_nowait(frame)
+                client.queue.put_nowait(frame)
+                try:
+                    client.wakeup_write.send(b"\0")
+                except (BlockingIOError, OSError):
+                    pass  # already signalled; the queue still has a frame
             except queue.Full:
                 pass  # drop: the newest frame matters, not every frame
 
-    def add_client(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=1)
+    def add_client(self) -> "Client":
+        client = Client()
         with self.lock:
-            self.clients.add(q)
-        return q
+            self.clients.add(client)
+        return client
 
-    def remove_client(self, q: queue.Queue) -> None:
+    def remove_client(self, client: "Client") -> None:
         with self.lock:
-            self.clients.discard(q)
+            self.clients.discard(client)
+        client.close()
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -499,8 +515,30 @@ class Hub:
                     self.proc.kill()
 
 
+class Client:
+    """A newest-frame queue and an fd which wakes its consumer on publish."""
+
+    def __init__(self):
+        self.queue: queue.Queue = queue.Queue(maxsize=1)
+        self.wakeup_fd, self.wakeup_write = socket.socketpair()
+        self.wakeup_fd.setblocking(False)
+        self.wakeup_write.setblocking(False)
+
+    def drain_wakeup(self) -> None:
+        while True:
+            try:
+                if not self.wakeup_fd.recv(4096):
+                    return
+            except BlockingIOError:
+                return
+
+    def close(self) -> None:
+        self.wakeup_fd.close()
+        self.wakeup_write.close()
+
+
 def ws_ping(sock: socket.socket) -> None:
-    sock.sendall(b"\x89\x00")
+    ws_send_frame(sock, b"", opcode=0x9)
 
 
 def ws_upgrade(handler) -> bool:
@@ -518,9 +556,9 @@ def ws_upgrade(handler) -> bool:
     return True
 
 
-def ws_send_frame(sock: socket.socket, payload: bytes) -> None:
-    """Server->client binary frame, unmasked (RFC 6455 5.1)."""
-    header = bytearray([0x82])
+def ws_send_frame(sock: socket.socket, payload: bytes, opcode: int = 0x2) -> None:
+    """Send one complete frame, waiting for a non-blocking socket as needed."""
+    header = bytearray([0x80 | opcode])
     n = len(payload)
     if n < 126:
         header.append(n)
@@ -530,7 +568,98 @@ def ws_send_frame(sock: socket.socket, payload: bytes) -> None:
     else:
         header.append(127)
         header += struct.pack(">Q", n)
-    sock.sendall(bytes(header) + payload)
+    header = bytes(header)
+    parts = [memoryview(header), memoryview(payload)]
+    deadline = time.monotonic() + 10.0
+
+    def wait_writable() -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("websocket send timed out")
+        while True:
+            try:
+                _, writable, _ = select.select([], [sock], [], remaining)
+                break
+            except InterruptedError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("websocket send timed out")
+        if not writable:
+            raise TimeoutError("websocket send timed out")
+
+    use_sendmsg = hasattr(sock, "sendmsg")
+    while parts:
+        try:
+            if use_sendmsg:
+                sent = sock.sendmsg(parts)
+            else:
+                sent = sock.send(parts[0])
+        except (AttributeError, NotImplementedError):
+            use_sendmsg = False
+            continue
+        except (BlockingIOError, InterruptedError):
+            wait_writable()
+            continue
+        if sent <= 0:
+            raise ConnectionError("websocket send returned zero")
+        while parts and sent >= len(parts[0]):
+            sent -= len(parts[0])
+            parts.pop(0)
+        if parts and sent:
+            parts[0] = parts[0][sent:]
+
+
+class WSClientParser:
+    """Incremental parser for the small masked client frames we accept."""
+
+    def __init__(self, max_message: int = 4096):
+        self.buf = bytearray()
+        self.max_message = max_message
+        self.fragment = bytearray()
+
+    def feed(self, data: bytes) -> list[tuple[str, bytes]]:
+        self.buf.extend(data)
+        events = []
+        while True:
+            if len(self.buf) < 2:
+                break
+            first, second = self.buf[0], self.buf[1]
+            masked = bool(second & 0x80)
+            length = second & 0x7f
+            pos = 2
+            if length == 126:
+                if len(self.buf) < 4: break
+                length = struct.unpack(">H", self.buf[2:4])[0]; pos = 4
+            elif length == 127:
+                if len(self.buf) < 10: break
+                length = struct.unpack(">Q", self.buf[2:10])[0]; pos = 10
+            if length > self.max_message or not masked:
+                raise ValueError("invalid or oversized websocket client frame")
+            if len(self.buf) < pos + 4 + length:
+                break
+            mask = self.buf[pos:pos + 4]; pos += 4
+            payload = bytes(self.buf[pos + i] ^ mask[i % 4] for i in range(length))
+            del self.buf[:pos + length]
+            opcode = first & 0x0f
+            final = bool(first & 0x80)
+            if opcode == 0x8:
+                events.append(("close", payload)); continue
+            if opcode == 0x9:
+                events.append(("ping", payload)); continue
+            if opcode == 0x0:
+                if not self.fragment: raise ValueError("unexpected continuation")
+                self.fragment.extend(payload)
+                if final:
+                    events.append(("text", bytes(self.fragment))); self.fragment.clear()
+            elif opcode == 0x1:
+                if self.fragment: raise ValueError("nested websocket fragment")
+                if final: events.append(("text", payload))
+                else: self.fragment.extend(payload)
+            else:
+                raise ValueError("unsupported websocket opcode")
+            if len(self.fragment) > self.max_message:
+                raise ValueError("oversized websocket message")
+        return events
 
 
 def make_handler(hub: Hub, clicker: "Clicker | None" = None,
@@ -647,36 +776,85 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.close_connection = True
-                q = hub.add_client()
+                client = hub.add_client()
                 try:
                     while True:
                         try:
-                            frame = q.get(timeout=5.0)
+                            frame = client.queue.get(timeout=3.0)
                         except queue.Empty:
-                            break
+                            with hub.lock:
+                                frame = hub.latest
+                            if frame is None:
+                                continue
                         self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
                         self.wfile.write(b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n")
                         self.wfile.write(frame + b"\r\n")
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 finally:
-                    hub.remove_client(q)
+                    hub.remove_client(client)
             elif path == "/ws":
                 if not ws_upgrade(self):
                     return
-                q = hub.add_client()
+                client = hub.add_client()
+                parser = WSClientParser()
+                pull = False
+                requested = False
+                last_sent = -1
+                last_ping = time.monotonic()
+                self.connection.setblocking(False)
                 try:
                     while True:
-                        try:
-                            frame = q.get(timeout=15.0)
-                        except queue.Empty:
+                        readable, _, _ = select.select(
+                            [self.connection, client.wakeup_fd], [], [], 10.0)
+                        timed_out = not readable
+                        if client.wakeup_fd in readable:
+                            client.drain_wakeup()
+                        if self.connection in readable:
+                            try:
+                                data = self.connection.recv(4096)
+                            except BlockingIOError:
+                                data = None
+                            if data == b"":
+                                break
+                            if data is not None:
+                                for kind, payload in parser.feed(data):
+                                    if kind == "close":
+                                        ws_send_frame(self.connection, payload[:125], 0x8)
+                                        return
+                                    if kind == "ping":
+                                        ws_send_frame(self.connection, payload[:125], 0xA)
+                                    if kind == "text":
+                                        text = payload.decode("ascii", "ignore")
+                                        if text == "pull":
+                                            pull = True
+                                            # Do not wait for a frame that the
+                                            # viewer cannot render yet.
+                                            requested = True
+                                        elif pull and text == "n":
+                                            requested = True
+                        frame = None
+                        if pull:
+                            if requested:
+                                with hub.lock:
+                                    if hub.latest is not None and hub.frame_id != last_sent:
+                                        frame = hub.latest
+                                        last_sent = hub.frame_id
+                                        requested = False
+                        else:
+                            try:
+                                frame = client.queue.get_nowait()
+                            except queue.Empty:
+                                pass
+                        if frame is not None:
+                            ws_send_frame(self.connection, frame)
+                        elif not pull and timed_out and time.monotonic() - last_ping >= 10:
                             ws_ping(self.connection)
-                            continue
-                        ws_send_frame(self.connection, frame)
-                except (BrokenPipeError, ConnectionResetError, OSError):
+                            last_ping = time.monotonic()
+                except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
                     pass
                 finally:
-                    hub.remove_client(q)
+                    hub.remove_client(client)
                 self.close_connection = True
             else:
                 self.send_error(404)
@@ -732,15 +910,20 @@ def _qv(quality: int) -> int:
     return max(1, min(31, 31 - int(quality * 0.31)))
 
 
-def default_capture_cmd(width: int, height: int, fps: int, quality: int) -> list[str]:
+def default_capture_cmd(width: int, height: int, fps: int, quality: int,
+                        static: bool = False) -> list[str]:
+    vf = "mpdecimate,setpts=N/FRAME_RATE/TB" if static else None
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-re", "-f", "lavfi", "-i", f"testsrc=size={width}x{height}:rate={fps}",
+        "-pix_fmt", "yuvj420p", "-huffman", "optimal",
+        *( ["-vf", vf] if vf else [] ),
         "-c:v", "mjpeg", "-q:v", str(_qv(quality)), "-f", "mjpeg", "-",
     ]
 
 
-def mac_capture_cmd(index: int, width: int, height: int, fps: int, quality: int) -> list[str]:
+def mac_capture_cmd(index: int, width: int, height: int, fps: int, quality: int,
+                    static: bool = False) -> list[str]:
     """macOS: AVFoundation screen device -> MJPEG on stdout.
 
     `index` is the AVFoundation video device index of the display, as printed by
@@ -753,16 +936,23 @@ def mac_capture_cmd(index: int, width: int, height: int, fps: int, quality: int)
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "avfoundation", "-framerate", str(fps),
         "-capture_cursor", "1", "-i", f"{index}:none",
-        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2",
+        "-vf", (f"scale={width}:{height}:force_original_aspect_ratio=decrease:"
+                f"force_divisible_by=2:flags=fast_bilinear" +
+                (",mpdecimate,setpts=N/FRAME_RATE/TB" if static else "")),
+        "-pix_fmt", "yuvj420p", "-huffman", "optimal",
         "-c:v", "mjpeg", "-q:v", str(_qv(quality)), "-f", "mjpeg", "-",
     ]
 
 
-def x11_capture_cmd(display: str, width: int, height: int, fps: int, quality: int) -> list[str]:
+def x11_capture_cmd(display: str, width: int, height: int, fps: int, quality: int,
+                    static: bool = False) -> list[str]:
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "x11grab", "-framerate", str(fps), "-i", display,
-        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2",
+        "-vf", (f"scale={width}:{height}:force_original_aspect_ratio=decrease:"
+                f"force_divisible_by=2:flags=fast_bilinear" +
+                (",mpdecimate,setpts=N/FRAME_RATE/TB" if static else "")),
+        "-pix_fmt", "yuvj420p", "-huffman", "optimal",
         "-c:v", "mjpeg", "-q:v", str(_qv(quality)), "-f", "mjpeg", "-",
     ]
 
@@ -774,6 +964,7 @@ PRESETS = {
     "mac-extended": (1280, 720, 15),
     "x11": (960, 540, 20),
 }
+PROFILES = {"sharp": (1280, 720), "balanced": (960, 540), "low": (800, 450)}
 
 
 def resolve_capture(args) -> list[str]:
@@ -788,13 +979,13 @@ def resolve_capture(args) -> list[str]:
     preset = args.preset or "test"
     quality = args.quality
     if preset == "test":
-        return default_capture_cmd(args.width, args.height, args.fps, quality)
+        return default_capture_cmd(args.width, args.height, args.fps, quality, getattr(args, "static", False))
     if preset == "mac-mirror":
-        return mac_capture_cmd(args.display_index, args.width, args.height, args.fps, quality)
+        return mac_capture_cmd(args.display_index, args.width, args.height, args.fps, quality, getattr(args, "static", False))
     if preset == "mac-extended":
-        return mac_capture_cmd(args.display_index, args.width, args.height, args.fps, quality)
+        return mac_capture_cmd(args.display_index, args.width, args.height, args.fps, quality, getattr(args, "static", False))
     if preset == "x11":
-        return x11_capture_cmd(args.display, args.width, args.height, args.fps, quality)
+        return x11_capture_cmd(args.display, args.width, args.height, args.fps, quality, getattr(args, "static", False))
     raise SystemExit(f"unknown preset: {preset}")
 
 
@@ -824,7 +1015,9 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8090, help="HTTP port (default 8090)")
     ap.add_argument("--bind", default="0.0.0.0", help="HTTP bind address")
     ap.add_argument("--preset", choices=sorted(PRESETS), default=None,
-                    help="capture preset: test | mac-mirror | mac-extended | x11 (default test)")
+                     help="capture preset: test | mac-mirror | mac-extended | x11 (default test)")
+    ap.add_argument("--profile", choices=("sharp", "balanced", "low"), default=None,
+                     help="size profile: sharp 1280x720, balanced 960x540, low 800x450")
     ap.add_argument("--source", default=None,
                     help="explicit capture command writing JPEG to stdout; placeholders "
                          "{w} {h} {fps} {q} (1..100) {qv} (ffmpeg -q:v 1..31)")
@@ -836,6 +1029,8 @@ def main() -> int:
     ap.add_argument("--height", type=int, default=None)
     ap.add_argument("--fps", type=int, default=None)
     ap.add_argument("--quality", type=int, default=65, help="1..100 (default 65)")
+    ap.add_argument("--static", action="store_true",
+                    help="drop unchanged frames with mpdecimate (preset capture only)")
     ap.add_argument("--dns-port", type=int, default=0,
                     help="also answer DNS A queries on this port (53 needs root)")
     ap.add_argument("--dns-answer", default=None, help="IP to answer with (default: LAN IP)")
@@ -861,6 +1056,8 @@ def main() -> int:
     args = ap.parse_args()
 
     pw, ph, pf = PRESETS[args.preset or "test"]
+    if args.profile:
+        pw, ph = PROFILES[args.profile]
     if args.width is None:
         args.width = pw
     if args.height is None:
