@@ -43,7 +43,7 @@ sudo python3 switchdisplay.py \
   --preset mac-mirror \
   --display-index 1 \
   --width 960 --height 540 --fps 15 --quality 65 \
-  --bind <mac-lan-ip> --port 8090 \
+  --bind <mac-lan-ip> --port 80 \
   --dns-port 53 --dns-answer <mac-lan-ip> \
   --click-secret 'CHANGE-ME-to-a-long-random-string' \
   --click-display-size 1512x982
@@ -54,8 +54,9 @@ sudo python3 switchdisplay.py \
 SPDisplaysDataType`), **not** the Retina pixel size. Omit `--click-secret` and
 the page is view-only. See [Tap-to-click](#tap-to-click-optional) below.
 
-`sudo` is only needed to bind DNS on port 53. If you would rather not run the
-whole thing as root, see "port 53 already in use" below.
+`sudo` is needed to bind ports 53 and 80. The server drops to the invoking user
+after binding those sockets and before starting ffmpeg. To avoid privileged HTTP,
+use `--port 8090` plus a pf TCP 80→8090 redirect.
 
 The resolved capture command (printed by `--print-source`, check it matches):
 
@@ -87,7 +88,7 @@ sudo python3 switchdisplay.py \
   --preset mac-extended \
   --display-index 2 \
   --width 1280 --height 720 --fps 15 --quality 65 \
-  --bind <mac-lan-ip> --port 8090 \
+  --bind <mac-lan-ip> --port 80 \
   --dns-port 53 --dns-answer <mac-lan-ip> \
   --click-secret 'CHANGE-ME-to-a-long-random-string' \
   --click-display-size 1280x720 \
@@ -149,7 +150,7 @@ Add `--click-dry-run`: the server resolves and logs the synthesizer command but
 executes nothing.
 
 ```bash
-curl -s -X POST http://<mac-lan-ip>:8090/click \
+curl -s -X POST http://<mac-lan-ip>:80/click \
   -H 'Content-Type: application/json' \
   -d '{"x":480,"y":270,"secret":"YOUR-SECRET"}'
 # {"ok":true,"click":{"nx":0.5,"ny":0.5,"px":756,"py":491,"tool":"cliclick","result":"dry-run",...},
@@ -162,7 +163,7 @@ A centre tap on a 960×540 frame must map to the centre of the display
 **Verify what happened**
 
 ```bash
-curl -s http://<mac-lan-ip>:8090/health | python3 -m json.tool
+curl -s http://<mac-lan-ip>:80/health | python3 -m json.tool
 # "clicks": {"received":N,"rejected":0,"limited":0,"synthesized":N,"bad_coords":0}
 # "last_click": {"nx":..,"ny":..,"px":..,"py":..,"tool":"cliclick","result":"clicked"}
 ```
@@ -173,10 +174,12 @@ curl -s http://<mac-lan-ip>:8090/health | python3 -m json.tool
   page has no tap handler at all.
 * Rate limit: at most **10 taps per 3 s**, minimum **80 ms** apart → 429 beyond.
 * Coordinates outside the current frame → 400 (no click).
-* Bind stays on the LAN address; nothing is exposed beyond the local network.
-* The page embeds the secret so its tap handler can POST (the applet has no
-  address bar, so nobody can fetch the page casually). Treat the secret as a
-  guard against stray LAN POSTs, not as authentication of a user.
+* With click enabled, the default bind is the LAN address rather than all
+  interfaces. Host validation rejects unrelated Host headers; use `--allow-host`
+  for an intentional additional name.
+* The page embeds the secret so its tap handler can POST. The secret is readable
+  by allowed LAN clients unless `--click-allow IP` is supplied; treat it as a
+  guard against stray POSTs, not as authentication of a user.
 
 ---
 
@@ -185,12 +188,12 @@ curl -s http://<mac-lan-ip>:8090/health | python3 -m json.tool
 On the Mac:
 
 ```bash
-curl -s http://<mac-lan-ip>:8090/health      # frames should be climbing
-curl -s --max-time 3 http://<mac-lan-ip>:8090/mjpeg | wc -c   # non-zero bytes
+curl -s http://<mac-lan-ip>:80/health      # frames should be climbing
+curl -s --max-time 3 http://<mac-lan-ip>:80/mjpeg | wc -c   # non-zero bytes
 ```
 
 On any other device on the same Wi‑Fi (phone is enough): open
-`http://<mac-lan-ip>:8090/` — if the phone shows the screen, the Mac side is
+`http://<mac-lan-ip>:80/` — if the phone shows the screen, the Mac side is
 good and the problem is the Switch's DNS/applet step.
 
 ### Troubleshooting
@@ -198,7 +201,7 @@ good and the problem is the Switch's DNS/applet step.
 | Symptom | Cause / fix |
 |---|---|
 | Frames are black | Screen Recording permission missing for the terminal → grant, **restart the terminal** |
-| `Address already in use` on port 53 | mDNSResponder/another resolver holds it. Either bind a different interface (`--dns-bind <mac-lan-ip>` is already the default when `--dns-answer` is set), or run `--dns-port 5353` and redirect with pf: `rdr on en0 inet proto udp from any to any port 53 -> <mac-lan-ip> port 5353` (also add the matching `nat`/`pass` rules; `sudo pfctl -f <file> -e`) |
+| `Address already in use` on port 53 or 80 | mDNSResponder/another resolver holds it. Bind another interface/service, or use 5353/8090 and pf redirects. DNS example: `rdr on en0 inet proto udp from any to any port 53 -> <mac-lan-ip> port 5353` HTTP example: `rdr on en0 inet proto tcp from any to any port 80 -> <mac-lan-ip> port 8090` (also add matching `nat`/`pass` rules; `sudo pfctl -f <file> -e`) |
 | Switch shows "Could not connect" | Mac firewall blocked `python3`, or the router has client isolation, or Mac and Switch are on different subnets/SSIDs |
 | Stream works on the phone but not the Switch | re-check primary DNS is exactly `<mac-lan-ip>`, secondary `8.8.8.8`, and that the applet (not a normal page) is what opened |
 | Very low fps | expected — the Switch's WebKit has **no JIT**; drop `--width/--height` (e.g. 800×450) or `--fps 10`, or lower `--quality` |
