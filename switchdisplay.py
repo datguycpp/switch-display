@@ -111,7 +111,7 @@ VIEWER_HTML = b"""<!doctype html>
   }
 
   if (!window.WebSocket) { mjpegFallback(); } else {
-    // ---- WebSocket + canvas: the spacedesk-HTML5-viewer pattern ----
+    // ---- WebSocket + canvas: the standard live-frame pattern ----
     (function connect() {
       var ws;
       try { ws = new WebSocket(url); } catch (e) { mjpegFallback(); return; }

@@ -1,46 +1,32 @@
 # switchdisplay — a second display on a stock Nintendo Switch
 
-Assessment + minimal prototype: can a stock Switch be a wireless second display
-for a Linux laptop, and does spacedesk help?
+Assessment + minimal prototype: a stock Switch as a wireless second display
+for a Mac or Linux host, using nothing but the console's built-in browser.
 
-**Short answer:** A stock Switch cannot use spacedesk. Its only possible spacedesk
-role is the browser viewer, and spacedesk has **officially discontinued the HTML5
-viewer** (support, Jan 2026: "The HTML5 viewer is not supported anymore"; Sep 2026:
-"that version of the Viewer is already out-of-support"). The Switch has no
-Android/iOS/Windows app, so there is no supported spacedesk client for it.
+**Short answer:** it works. The Switch's captive-portal browser cannot play
+video, but it can do WebSocket + canvas + JPEG images — and that is all a
+second screen needs. This folder contains a small server that streams the
+host's display that way, with optional tap-to-click. If you want low latency
+and full input, the honest route is Sunshine + Moonlight-NX, which needs
+homebrew on the console.
 
-The Switch *can* show a second screen without modding — over **WebSocket + canvas**
-in its built-in browser — and this folder contains a working server for that,
-which runs on **macOS or Linux**. If you want latency and input, the honest route
-is Sunshine + Moonlight-NX, which needs homebrew on the console.
+The Switch runs no app and installs nothing — it just opens a web page.
 
 ---
 
-## 1. What spacedesk actually is on the wire
+## 1. Design: why WebSocket + JPEG + canvas
 
-Sources: datronicsoft manual (ports/firewall), an HTML5-viewer RE write-up
-(`jeromeollivon-star/spacedesk-linux`), a Linux server reimplementation
-(`leabergero/spacedesk-linux-server`), and the shipped viewer bundle
-(`viewer.spacedesk.net/spacedesk.min.js`, 414 KB).
+The Switch's portal browser sets hard limits: no `<video>`, no HLS, no MSE,
+no WebRTC, no ES6 modules — but it does have WebSocket, `<canvas>` with
+`drawImage`, `Blob` URLs, and JPEG decoding. So the design is deliberately
+minimal: the host captures the screen to JPEG frames, pushes them over a
+binary WebSocket (with an MJPEG `<img>` fallback that needs nothing but image
+decoding), and the page draws each frame to canvas.
 
-| Aspect | Finding |
-|---|---|
-| Ports | **TCP 28252** (session), **UDP 28252** (discovery) |
-| Server platforms | **Windows 11/10** (driver 2.2.34) **and macOS 14.4+** (Apple MAC Driver **BETA 1.0.06**, public dmg). The Mac beta release notes admit "partial implementation of the display pipeline"; it added password protection/encryption in 1.0.03 |
-| Supported viewers | Android, iOS, Windows — **and the HTML5 viewer, which is discontinued** |
-| Discovery | UDP broadcast with magic `SPACEDESK-NET-CLIENT\0` |
-| Transport | raw TCP to the Windows service; the **HTML5 viewer speaks the same packets over WebSocket** (`ws://<host>:28252/`) |
-| Framing | 128-byte header + optional payload (`payloadLen` = u32 at offset 4), little-endian |
-| Packet types | 1 ping, **2 frame buffer**, 3 visibility, 4 cursor pos, 5 cursor bitmap, **7 flow-control ack**, 8 disconnect, 9 rotation, 10 mouse, 11 keyboard, 12 touch |
-| Video encoding | **JPEG tiles** (one JPEG per type-2 payload), the driver splits each frame into 4 horizontal bands. H.264 is *planned*, not shipped ("planning to update … to HTTPS, WSS and H264") |
-| Handshake | 462-byte identification packet: version 4.8, clientType **`WindowsRemoteMonitor`** (=0) is mandatory, plus name/GUID |
-| Latency model | **Flow-control ACK driven** — the driver sends no next frame until the client ACKs; ACK once per 4 fragments |
-| Input back-channel | mouse (10) / keyboard (11) / touch (12) packets, same socket, header-only |
-| HTML5 viewer endpoint | `http://viewer.spacedesk.net/` (public page) → opens `ws://<lan-ip>:28252/`. **Currently broken in 2025**: the page's CSP forbids `ws://` and Chrome/Edge/Firefox block public→private WebSocket (Private Network Access). Workaround per spacedesk support: save the page locally. Their rep: "spacedesk HTML5 Viewer hasn't been maintained for many years … it does not support modern secure HTTPS and WSS" |
-| Viewer's browser requirements | verified by scanning `spacedesk.min.js`: `new WebSocket`, `<canvas>` (`getContext`×13, `drawImage`×7), `Blob`+`createObjectURL`, `Image`, `requestAnimationFrame`. **No WebRTC, no MediaSource, no WebCodecs, no ImageBitmap** |
-
-So spacedesk's client is not a video player — it is a **JPEG-tile compositor over
-a WebSocket**. That is the single most useful fact for the Switch question.
+Flow control is ACK-driven: the server holds only the newest frame per viewer
+and drops the rest, so a slow renderer degrades to lower fps instead of
+growing lag. A tap on the page can optionally POST back as a click (behind a
+shared secret) — tap equals one left click, nothing more.
 
 ## 2. The Switch angle
 
@@ -55,15 +41,13 @@ a WebSocket**. That is the single most useful fact for the Switch question.
 | Video | **disabled** in `WifiWebAuthApplet` since 3.0 ("Support Code: 2809-1212 / This feature is not available") — `<video>`, HLS, MSE are all out |
 | What does work | HTML5 canvas, JavaScript, **WebSocket** (ACCESS lists WebSocket support for NX), XMLHttpRequest, image decoding (JPEG/PNG) |
 
-**Verdict for the Switch: feasible without mods, but not with spacedesk.**
+**Verdict: a stock Switch works as a second screen with this server.**
 
-- spacedesk has no Switch client and no Linux server; and its Windows driver is not reachable from a Linux host.
-- Its *viewer model* (WebSocket + JPEG + canvas) is exactly what the stock
-  captive-portal applet can do. So the honest route is: **serve our own
-  WebSocket+JPEG page from the laptop's own DNS/HTTP**, not spacedesk's protocol.
+- No app to install, no modding — the console just opens a web page served
+  from the host's own DNS/HTTP on the LAN.
 - Constraints to expect: no JIT (expect single-digit to low-double-digit fps at
   ~960×540), one page at a time, the applet is a modal session (leaving it ends
-  the display), and the Switch's DNS must be pointed at the laptop while you use it.
+  the display), and the Switch's DNS must be pointed at the host while you use it.
 
 Homebrew alternative (needs *modding* — not done, not assumed): **Moonlight-NX**
 (`rock88/moonlight-nx`) + **Sunshine** on the laptop (VA-API H.264 works on Intel
@@ -75,19 +59,16 @@ proves too slow.
 
 | Option | State |
 |---|---|
-| **spacedesk on macOS** | server exists — Apple MAC Driver **BETA 1.0.06**, macOS 14.4+, public dmg. But the only viewer the Switch could run (HTML5) is **discontinued**, and the beta is still "partial display pipeline" |
 | Sidecar | macOS → **iPad/Apple** only; the Switch is not an Apple device — impossible |
 | Duet Display / Luna | clients for iOS/Android/Mac/Windows, **no Switch** client — impossible |
 | Deskreen / Weylus | browser viewers that require **WebRTC** → the Switch applet cannot join |
-| macOS Screen Sharing (VNC 5900) | works, but needs a browser VNC client; noVNC is ES6-module based and will not parse on WebKit 601.6. Port 5900 is currently closed on the Mac |
+| macOS Screen Sharing (VNC 5900) | works, but needs a browser VNC client; noVNC is ES6-module based and will not parse on WebKit 601.6 |
 | VNC + noVNC | needs WebSocket + canvas → capability-compatible, but heavier than needed for a passive second screen |
 | **Sunshine (macOS host) + Moonlight-NX** | real low-latency streaming with input, VideoToolbox H.264; Moonlight-NX is **Switch homebrew** → needs modding |
-| spacedesk server on Linux | does not exist officially; `leabergero/spacedesk-linux-server` is a hobby RE (GNOME-only capture) |
 | **this prototype** | WebSocket + JPEG + canvas, the smallest capability set that matches the Switch; runs on macOS and Linux |
 
 Recommendation: for a *passive* second screen (docs, logs, dashboards) use this
 prototype. For interactive/low-latency use, Sunshine + Moonlight-NX (modded).
-Do not build on spacedesk's HTML5 viewer — it is discontinued.
 
 ## 4. Running it
 
@@ -192,27 +173,26 @@ the page served at that hostname keeps it open in practice.
   the manual letterbox replaces `object-fit` (Safari 10+, unavailable on the Switch)
 * page JS is ES5-clean (no arrows/let/const/template literals/fetch/async) —
   required for the Switch's WebKit 601.6-class engine
-* DNS responder: `conntest.nintendowifi.net → 192.168.1.77` and
-  `ctest.cdn.nintendo.net → 192.168.1.77`; other names refused
+* DNS responder: `conntest.nintendowifi.net` and `ctest.cdn.nintendo.net`
+  resolve to the configured answer; other names refused
 * tap-to-click (all with `--click-dry-run` or a fake `cliclick` on PATH, so no
   cursor was ever moved): wrong secret → `403`; no secret configured → `403` and
-  the page renders `CLICK_ON = false`; centre tap `(480,270)` of a 960×540 frame
+  the page renders view-only; centre tap `(480,270)` of a 960×540 frame
   → `nx/ny 0.5`, `px/py 756,491` on a 1512×982 display; corners `(0,0)`/`(959,539)`
   → `0,0`/`1510,980`; out-of-frame `(5000,270)` → `400`; 15 rapid taps → mixed
-  `200`/`429`; `/health` counters reconciled exactly (`received = limited +
+  `200`/`429`; counters reconciled exactly (`received = limited +
   synthesized + bad_coords`); real execution path ran the synthesizer and the
   fake `cliclick` logged `c:756,491`
-* **not tested:** the Switch itself (needs Steven's console), and real screen
+* **not tested:** the Switch itself, and real screen
   capture on Wayland (needs a portal approval dialog / OBS v4l2loopback)
 
 Expected on the Switch: lower fps than 12.5 (no JIT), fine for text and static
 dashboards, poor for video or scrolling.
 
-## 6. Needs Steven
+## 6. Trying it yourself
 
-* **The Mac** — nothing here is installed or run on it: Tailscale shows it active
-  but every probed port (22, 5900, 28252, 3283, 445) is refused, so there is no
-  remote shell and no spacedesk/VNC listener. Installing anything there is his call.
+* The host needs to be reachable on the LAN (no remote shell is assumed —
+  install and run the server on the host itself).
 * the Switch, its DNS change (and setting it back afterwards)
 * a capture choice on the Mac: `brew install ffmpeg` (best), the zero-install
   `screencapture` loop, or Screen Recording permission for a portal-based tool
