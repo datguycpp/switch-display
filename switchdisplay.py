@@ -429,7 +429,7 @@ class Hub:
         self.latest: bytes | None = None
         self.frame_size: tuple[int, int] | None = None
         self.lock = threading.Lock()
-        self.clients: set[queue.Queue] = set()
+        self.clients: set[Client] = set()
         self.frames = 0
         self.proc: subprocess.Popen | None = None
         self.stderr_tail: list[str] = []
@@ -479,21 +479,26 @@ class Hub:
             self.frames += 1
             self.frame_id += 1
             clients = list(self.clients)
-        for q in clients:
+        for client in clients:
             try:
-                q.put_nowait(frame)
+                client.queue.put_nowait(frame)
+                try:
+                    client.wakeup_write.send(b"\0")
+                except (BlockingIOError, OSError):
+                    pass  # already signalled; the queue still has a frame
             except queue.Full:
                 pass  # drop: the newest frame matters, not every frame
 
-    def add_client(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=1)
+    def add_client(self) -> "Client":
+        client = Client()
         with self.lock:
-            self.clients.add(q)
-        return q
+            self.clients.add(client)
+        return client
 
-    def remove_client(self, q: queue.Queue) -> None:
+    def remove_client(self, client: "Client") -> None:
         with self.lock:
-            self.clients.discard(q)
+            self.clients.discard(client)
+        client.close()
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -508,6 +513,28 @@ class Hub:
                     os.killpg(self.proc.pid, signal.SIGKILL)
                 except OSError:
                     self.proc.kill()
+
+
+class Client:
+    """A newest-frame queue and an fd which wakes its consumer on publish."""
+
+    def __init__(self):
+        self.queue: queue.Queue = queue.Queue(maxsize=1)
+        self.wakeup_fd, self.wakeup_write = socket.socketpair()
+        self.wakeup_fd.setblocking(False)
+        self.wakeup_write.setblocking(False)
+
+    def drain_wakeup(self) -> None:
+        while True:
+            try:
+                if not self.wakeup_fd.recv(4096):
+                    return
+            except BlockingIOError:
+                return
+
+    def close(self) -> None:
+        self.wakeup_fd.close()
+        self.wakeup_write.close()
 
 
 def ws_ping(sock: socket.socket) -> None:
@@ -530,7 +557,7 @@ def ws_upgrade(handler) -> bool:
 
 
 def ws_send_frame(sock: socket.socket, payload: bytes, opcode: int = 0x2) -> None:
-    """Send an unmasked server frame, using sendmsg to avoid a copy when possible."""
+    """Send one complete frame, waiting for a non-blocking socket as needed."""
     header = bytearray([0x80 | opcode])
     n = len(payload)
     if n < 126:
@@ -542,16 +569,37 @@ def ws_send_frame(sock: socket.socket, payload: bytes, opcode: int = 0x2) -> Non
         header.append(127)
         header += struct.pack(">Q", n)
     header = bytes(header)
-    if not hasattr(sock, "sendmsg"):
-        sock.sendall(header + payload)
-        return
     parts = [memoryview(header), memoryview(payload)]
+    deadline = time.monotonic() + 10.0
+
+    def wait_writable() -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("websocket send timed out")
+        while True:
+            try:
+                _, writable, _ = select.select([], [sock], [], remaining)
+                break
+            except InterruptedError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("websocket send timed out")
+        if not writable:
+            raise TimeoutError("websocket send timed out")
+
+    use_sendmsg = hasattr(sock, "sendmsg")
     while parts:
         try:
-            sent = sock.sendmsg(parts)
+            if use_sendmsg:
+                sent = sock.sendmsg(parts)
+            else:
+                sent = sock.send(parts[0])
         except (AttributeError, NotImplementedError):
-            sock.sendall(b"".join(parts))
-            return
+            use_sendmsg = False
+            continue
+        except (BlockingIOError, InterruptedError):
+            wait_writable()
+            continue
         if sent <= 0:
             raise ConnectionError("websocket send returned zero")
         while parts and sent >= len(parts[0]):
@@ -728,11 +776,11 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.close_connection = True
-                q = hub.add_client()
+                client = hub.add_client()
                 try:
                     while True:
                         try:
-                            frame = q.get(timeout=3.0)
+                            frame = client.queue.get(timeout=3.0)
                         except queue.Empty:
                             with hub.lock:
                                 frame = hub.latest
@@ -744,11 +792,11 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 finally:
-                    hub.remove_client(q)
+                    hub.remove_client(client)
             elif path == "/ws":
                 if not ws_upgrade(self):
                     return
-                q = hub.add_client()
+                client = hub.add_client()
                 parser = WSClientParser()
                 pull = False
                 requested = False
@@ -757,30 +805,34 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 self.connection.setblocking(False)
                 try:
                     while True:
-                        # Poll frequently in push mode so delivery is not
-                        # capped by the old keepalive timeout.  The queue is
-                        # bounded to one newest frame per client.
-                        timeout = 0.02 if not pull else 0.2
-                        readable, _, _ = select.select([self.connection], [], [], timeout)
-                        if readable:
-                            data = self.connection.recv(4096)
-                            if not data:
+                        readable, _, _ = select.select(
+                            [self.connection, client.wakeup_fd], [], [], 10.0)
+                        timed_out = not readable
+                        if client.wakeup_fd in readable:
+                            client.drain_wakeup()
+                        if self.connection in readable:
+                            try:
+                                data = self.connection.recv(4096)
+                            except BlockingIOError:
+                                data = None
+                            if data == b"":
                                 break
-                            for kind, payload in parser.feed(data):
-                                if kind == "close":
-                                    ws_send_frame(self.connection, payload[:125], 0x8)
-                                    return
-                                if kind == "ping":
-                                    ws_send_frame(self.connection, payload[:125], 0xA)
-                                if kind == "text":
-                                    text = payload.decode("ascii", "ignore")
-                                    if text == "pull":
-                                        pull = True
-                                        # Do not wait for a frame that the
-                                        # viewer cannot render yet.
-                                        requested = True
-                                    elif pull and text == "n":
-                                        requested = True
+                            if data is not None:
+                                for kind, payload in parser.feed(data):
+                                    if kind == "close":
+                                        ws_send_frame(self.connection, payload[:125], 0x8)
+                                        return
+                                    if kind == "ping":
+                                        ws_send_frame(self.connection, payload[:125], 0xA)
+                                    if kind == "text":
+                                        text = payload.decode("ascii", "ignore")
+                                        if text == "pull":
+                                            pull = True
+                                            # Do not wait for a frame that the
+                                            # viewer cannot render yet.
+                                            requested = True
+                                        elif pull and text == "n":
+                                            requested = True
                         frame = None
                         if pull:
                             if requested:
@@ -791,18 +843,18 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                                         requested = False
                         else:
                             try:
-                                frame = q.get_nowait()
+                                frame = client.queue.get_nowait()
                             except queue.Empty:
                                 pass
                         if frame is not None:
                             ws_send_frame(self.connection, frame)
-                        elif not pull and not readable and time.monotonic() - last_ping >= 10:
+                        elif not pull and timed_out and time.monotonic() - last_ping >= 10:
                             ws_ping(self.connection)
                             last_ping = time.monotonic()
                 except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
                     pass
                 finally:
-                    hub.remove_client(q)
+                    hub.remove_client(client)
                 self.close_connection = True
             else:
                 self.send_error(404)

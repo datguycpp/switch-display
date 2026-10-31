@@ -1,7 +1,10 @@
 import http.client
 import inspect
 import json
+import select
+import socket
 import threading
+import time
 import unittest
 import struct
 from http.server import ThreadingHTTPServer
@@ -93,9 +96,65 @@ class Tests(unittest.TestCase):
     def test_pull_and_push_websocket_flow_control(self):
         handler = inspect.getsource(switchdisplay.make_handler)
         self.assertIn('if text == "pull":', handler)
-        self.assertIn('pull = True\n                                        # Do not wait', handler)
+        self.assertIn('pull = True', handler)
+        self.assertIn('viewer cannot render yet', handler)
         self.assertIn('requested = True', handler)
-        self.assertIn('timeout = 0.02 if not pull else 0.2', handler)
+        self.assertIn('client.wakeup_fd', handler)
+        self.assertNotIn('timeout = 0.02 if not pull else 0.2', handler)
+
+    def test_client_wakeup_on_publish_without_idle_spin(self):
+        hub = switchdisplay.Hub([])
+        client = hub.add_client()
+        try:
+            readable, _, _ = select.select([client.wakeup_fd], [], [], 0)
+            self.assertEqual(readable, [])
+            hub._publish(b"\xff\xd8" + b"x" * 64 + b"\xff\xd9")
+            started = time.monotonic()
+            readable, _, _ = select.select([client.wakeup_fd], [], [], 0.1)
+            self.assertTrue(readable)
+            self.assertLess(time.monotonic() - started, 0.1)
+            self.assertIsNotNone(client.queue.get_nowait())
+        finally:
+            hub.remove_client(client)
+
+    def test_nonblocking_websocket_send_preserves_large_frames(self):
+        server, reader = socket.socketpair()
+        server.setblocking(False)
+        reader.setblocking(False)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        frames = [bytes([i]) * 200000 for i in range(3)]
+        received = bytearray()
+
+        def send():
+            for payload in frames:
+                switchdisplay.ws_send_frame(server, payload)
+
+        thread = threading.Thread(target=send)
+        thread.start()
+        try:
+            while thread.is_alive() or select.select([reader], [], [], 0)[0]:
+                if not select.select([reader], [], [], 0.1)[0]:
+                    continue
+                chunk = reader.recv(137)
+                if not chunk:
+                    break
+                received.extend(chunk)
+                time.sleep(0.0005)
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            pos = 0
+            for payload in frames:
+                self.assertEqual(received[pos], 0x82)
+                self.assertEqual(received[pos + 1], 127)
+                length = struct.unpack(">Q", received[pos + 2:pos + 10])[0]
+                self.assertEqual(length, len(payload))
+                start = pos + 10
+                self.assertEqual(bytes(received[start:start + length]), payload)
+                pos = start + length
+            self.assertEqual(pos, len(received))
+        finally:
+            server.close()
+            reader.close()
 
     def test_host_validation(self):
         hub = switchdisplay.Hub([])
