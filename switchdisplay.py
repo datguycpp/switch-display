@@ -74,8 +74,7 @@ VIEWER_HTML = b"""<!doctype html>
   window.__taps = 0;
   window.__mode = 'none';
 
-  // -- object-fit is not available on the Switch's WebKit (Safari 9 class):
-  //    letterbox manually so a 960x540 frame fills the screen undistorted.
+  // -- Letterbox manually for the Switch's Safari 9-class WebKit.
   var mediaEl = null;
   function fit() {
     if (!mediaEl) return;
