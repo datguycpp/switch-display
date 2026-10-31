@@ -14,7 +14,7 @@ duration, and changed back afterwards.
 | Step | How |
 |---|---|
 | **Same Wi‑Fi** | Mac and Switch on the **same 5 GHz SSID** (2.4 GHz caps bandwidth and adds latency). Router must **not** have "AP/client isolation" enabled, or the Switch cannot reach the Mac at all. |
-| **LAN IP confirmed** | `ipconfig getifaddr en0` → note the IP it prints and use it everywhere below as `<mac-lan-ip>`. Do **not** use the Tailscale IP — the Switch cannot join the tailnet. |
+| **LAN IP confirmed** | `ipconfig getifaddr en0` → note the IP it prints and use it everywhere below as `<mac-lan-ip>`. Use the address on the same local network as the Switch. |
 | **Python 3** | `python3 --version`. If macOS asks to install Command Line Tools, accept once. |
 | **ffmpeg** | `brew install ffmpeg` (needs Homebrew). Verify: `ffmpeg -version`. |
 | **Screen Recording permission** | System Settings → Privacy & Security → **Screen Recording** → enable **Terminal** (or iTerm/the app you launch from), then **quit and reopen** that terminal. *Without this, AVFoundation returns BLACK frames and no error.* |
