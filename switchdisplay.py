@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+import signal
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -100,11 +101,19 @@ VIEWER_HTML = b"""<!doctype html>
 
   // ---- MJPEG fallback: an <img> needs nothing but image decoding ----
   function mjpegFallback() {
+    if (window.__mode === 'mjpeg') return;
     window.__mode = 'mjpeg';
     var img = document.createElement('img');
+    var stall;
     mediaEl = img;
-    img.onload = function () { window.__frames++; fit(); };
-    img.src = '/mjpeg?' + (new Date().getTime());
+    function restart() {
+      img.src = '/mjpeg?' + (new Date().getTime());
+      window.clearTimeout(stall);
+      stall = window.setTimeout(restart, 8000);
+    }
+    img.onload = function () { frames++; window.__frames++; fit(); restart(); };
+    img.onerror = restart;
+    restart();
     document.getElementById('wrap').appendChild(img);
     canvas.style.display = 'none';
     hud.textContent = 'mjpeg';
@@ -114,13 +123,25 @@ VIEWER_HTML = b"""<!doctype html>
     // ---- WebSocket + canvas: the standard live-frame pattern ----
     (function connect() {
       var ws;
+      var gotMessage = false;
+      var attempts = window.__wsAttempts || 0;
+      window.__wsAttempts = attempts + 1;
       try { ws = new WebSocket(url); } catch (e) { mjpegFallback(); return; }
       window.__mode = 'ws';
       ws.binaryType = 'arraybuffer';
       ws.onopen = function () { hud.textContent = 'ws open'; };
       ws.onmessage = function (ev) {
+        gotMessage = true;
         frames++;
-        var blob = new Blob([ev.data], { type: 'image/jpeg' });
+        if (window.__decoding) {
+          window.__pending = ev.data;
+          return;
+        }
+        decode(ev.data);
+      };
+      function decode(data) {
+        window.__decoding = true;
+        var blob = new Blob([data], { type: 'image/jpeg' });
         var u = window.URL.createObjectURL(blob);
         var img = new Image();
         img.onload = function () {
@@ -129,14 +150,20 @@ VIEWER_HTML = b"""<!doctype html>
           }
           ctx.drawImage(img, 0, 0);
           window.URL.revokeObjectURL(u);
-          mediaEl = canvas;
-          fit();
-          window.__frames++;
-        };
-        img.onerror = function () { window.URL.revokeObjectURL(u); };
-        img.src = u;
-      };
+           mediaEl = canvas;
+           fit();
+           window.__frames++;
+           window.__decoding = false;
+           if (window.__pending) { var next = window.__pending; window.__pending = null; decode(next); }
+         };
+         img.onerror = function () {
+           window.URL.revokeObjectURL(u); window.__decoding = false;
+           if (window.__pending) { var next = window.__pending; window.__pending = null; decode(next); }
+         };
+         img.src = u;
+      }
       ws.onclose = function () {
+        if (!gotMessage && attempts >= 3) { mjpegFallback(); return; }
         hud.textContent = 'reconnecting...';
         window.setTimeout(connect, 1000);
       };
@@ -145,11 +172,14 @@ VIEWER_HTML = b"""<!doctype html>
   }
 
   // ---- fullscreen toggle (its own button: body taps are clicks on the Mac) ----
-  document.getElementById('fs').addEventListener('click', function (ev) {
+  function fullscreen(ev) {
     ev.stopPropagation();
     var el = document.documentElement;
     if (el.requestFullscreen) { el.requestFullscreen(); }
-  }, false);
+    else if (el.webkitRequestFullscreen) { el.webkitRequestFullscreen(); }
+  }
+  document.getElementById('fs').addEventListener('click', fullscreen, false);
+  document.getElementById('fs').addEventListener('touchend', fullscreen, false);
 
   // ---- tap-to-click: tap only. No drag, no hover, no right click, no keys. ----
   function flash(cx, cy) {
@@ -194,6 +224,11 @@ VIEWER_HTML = b"""<!doctype html>
   if (CLICK_ON) {
     var lastTap = 0;
     var onTap = function (ev) {
+      var target = ev.target;
+      while (target) {
+        if (target === document.getElementById('fs')) { return; }
+        target = target.parentNode;
+      }
       var now = new Date().getTime();
       if (now - lastTap < 400) { return; }   // swallow the synthetic click after touch
       lastTap = now;
@@ -214,9 +249,12 @@ VIEWER_HTML = b"""<!doctype html>
 
 def render_viewer(click_enabled: bool, secret: str) -> bytes:
     """Inject the click flag/secret into the static page (JS literals, JSON-escaped)."""
+    literal = json.dumps(secret if click_enabled else "")
+    literal = (literal.replace("<", "\\u003c").replace(">", "\\u003e")
+               .replace("&", "\\u0026"))
     return (VIEWER_HTML
             .replace(b"__CLICK_ON__", b"true" if click_enabled else b"false")
-            .replace(b"__CLICK_SECRET__", json.dumps(secret if click_enabled else "").encode()))
+            .replace(b"__CLICK_SECRET__", literal.encode()))
 
 
 def jpeg_size(data: bytes) -> tuple[int, int] | None:
@@ -269,6 +307,12 @@ class Clicker:
 
     def check_secret(self, candidate: str) -> bool:
         return hmac.compare_digest(str(candidate).encode(), self.secret.encode())
+
+    def reject(self, ip: str) -> None:
+        """Count a failed authentication attempt against the per-IP limiter."""
+        with self._lock:
+            self.stats["rejected"] += 1
+            self._rate_ok(ip)
 
     def _rate_ok(self, ip: str) -> bool:
         now = time.monotonic()
@@ -333,6 +377,29 @@ class Clicker:
         return 200, {"ok": True, "click": self.last_click, "command": " ".join(argv)}
 
 
+def split_jpeg_stream(chunks, max_buffer: int = 8 * 1024 * 1024):
+    """Yield complete JPEGs from arbitrary chunks of a concatenated stream."""
+    buf = bytearray()
+    for chunk in chunks:
+        buf.extend(chunk)
+        if len(buf) > max_buffer:
+            del buf[:]
+            continue
+        while True:
+            start = buf.find(b"\xff\xd8")
+            if start < 0:
+                if len(buf) > 1:
+                    del buf[:-1]
+                break
+            if start:
+                del buf[:start]
+            end = buf.find(b"\xff\xd9", 2)
+            if end < 0:
+                break
+            yield bytes(buf[:end + 2])
+            del buf[:end + 2]
+
+
 class Hub:
     """One capture subprocess feeding N websocket clients and the MJPEG endpoint."""
 
@@ -348,7 +415,8 @@ class Hub:
         self.started = time.time()
 
     def start(self) -> None:
-        self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     start_new_session=True)
         threading.Thread(target=self._read_frames, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
 
@@ -359,13 +427,14 @@ class Hub:
             del self.stderr_tail[:-20]
 
     def _read_frames(self) -> None:
-        """Split the stdout byte stream on JPEG SOI markers.
+        """Split a concatenated JPEG stream at SOI/EOI markers.
 
-        Safe: 0xFF inside JPEG entropy data is byte-stuffed as 0xFF00, so the
-        two-byte sequence FF D8 only ever appears at the start of a frame.
+        Bytes before the first SOI are discarded.  EOI is used so each frame is
+        published immediately; an 8 MiB cap prevents a broken source growing
+        memory without bound.
         """
         assert self.proc and self.proc.stdout
-        buf = b""
+        buf = bytearray()
         while True:
             # read1 returns whatever is available: read(n) would block until the
             # full 64 KB fills, which throttles a 20 fps stream to a few fps
@@ -373,15 +442,28 @@ class Hub:
             chunk = self.proc.stdout.read1(65536)
             if not chunk:
                 break
-            buf += chunk
-            start = buf.find(b"\xff\xd8")
+            buf.extend(chunk)
+            if len(buf) > 8 * 1024 * 1024:
+                self.stderr_tail.append("frame splitter buffer exceeded 8 MiB; reset")
+                del buf[:]
+                continue
             while True:
-                nxt = buf.find(b"\xff\xd8", start + 2) if start >= 0 else -1
-                if start < 0 or nxt < 0:
+                start = buf.find(b"\xff\xd8")
+                if start < 0:
+                    if len(buf) > 1:
+                        del buf[:-1]
                     break
-                self._publish(buf[start:nxt])
-                buf = buf[nxt:]
-                start = 0
+                if start:
+                    del buf[:start]
+                end = buf.find(b"\xff\xd9", 2)
+                if end < 0:
+                    break
+                frame = bytes(buf[:end + 2])
+                del buf[:end + 2]
+                self._publish(frame)
+        if self.proc and self.proc.returncode is None:
+            self.proc.poll()
+        self.stderr_tail.append(f"capture process exited ({self.proc.returncode})")
 
     def _publish(self, frame: bytes) -> None:
         if len(frame) < 64:  # truncated tail: not a frame
@@ -409,11 +491,21 @@ class Hub:
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except OSError:
+                self.proc.terminate()
             try:
                 self.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
+                try:
+                    os.killpg(self.proc.pid, signal.SIGKILL)
+                except OSError:
+                    self.proc.kill()
+
+
+def ws_ping(sock: socket.socket) -> None:
+    sock.sendall(b"\x89\x00")
 
 
 def ws_upgrade(handler) -> bool:
@@ -446,7 +538,9 @@ def ws_send_frame(sock: socket.socket, payload: bytes) -> None:
     sock.sendall(bytes(header) + payload)
 
 
-def make_handler(hub: Hub, clicker: "Clicker | None" = None):
+def make_handler(hub: Hub, clicker: "Clicker | None" = None,
+                 allowed_hosts: set[str] | None = None,
+                 click_allow: set[str] | None = None):
     from http.server import BaseHTTPRequestHandler
 
     class Handler(BaseHTTPRequestHandler):
@@ -464,7 +558,23 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None):
             self.end_headers()
             self.wfile.write(body)
 
+        def _host_ok(self) -> bool:
+            host = self.headers.get("Host", "").rsplit("@", 1)[-1]
+            if host.startswith("["):
+                host = host[1:].split("]", 1)[0]
+            else:
+                host = host.split(":", 1)[0]
+            if host.lower() in (allowed_hosts or set()):
+                return True
+            self.send_error(403, "host not allowed")
+            return False
+
+        def _click_client_ok(self) -> bool:
+            return not click_allow or self.client_address[0] in click_allow
+
         def do_POST(self):
+            if not self._host_ok():
+                return
             path = self.path.split("?")[0]
             if path != "/click":
                 self.send_error(404)
@@ -485,9 +595,14 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None):
             except ValueError:
                 self._json(400, {"error": "bad json"})
                 return
+            if not isinstance(payload, dict):
+                self._json(400, {"error": "json object required"})
+                return
+            if not self._click_client_ok():
+                self._json(403, {"error": "clicks not allowed from this client"})
+                return
             if not clicker.check_secret(payload.get("secret", "")):
-                with clicker._lock:
-                    clicker.stats["rejected"] += 1
+                clicker.reject(self.client_address[0])
                 self._json(403, {"error": "bad secret"})
                 return
             try:
@@ -500,9 +615,11 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None):
             self._json(code, body)
 
         def do_GET(self):
+            if not self._host_ok():
+                return
             path = self.path.split("?")[0]
             if path == "/":
-                page = render_viewer(clicker is not None,
+                page = render_viewer(clicker is not None and self._click_client_ok(),
                                      clicker.secret if clicker else "")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -516,6 +633,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None):
                     "clients": len(hub.clients),
                     "uptime_s": round(time.time() - hub.started, 1),
                     "source_alive": bool(hub.proc and hub.proc.poll() is None),
+                    "source_exit_code": hub.proc.returncode if hub.proc else None,
                     "source_stderr": hub.stderr_tail[-3:],
                     "frame_size": hub.frame_size,
                     "clicks": clicker.stats if clicker else None,
@@ -531,7 +649,9 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None):
                 self.send_response(200)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
                 self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
                 self.end_headers()
+                self.close_connection = True
                 q = hub.add_client()
                 try:
                     while True:
@@ -555,6 +675,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None):
                         try:
                             frame = q.get(timeout=15.0)
                         except queue.Empty:
+                            ws_ping(self.connection)
                             continue
                         ws_send_frame(self.connection, frame)
                 except (BrokenPipeError, ConnectionResetError, OSError):
@@ -568,44 +689,47 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None):
     return Handler
 
 
-def dns_responder(bind: str, port: int, answer: str, names: list[str] | None) -> None:
+def dns_answer(data: bytes, answer: str, wanted: set[str]) -> bytes | None:
+    """Build a minimal DNS response, or None for malformed/non-query input."""
+    try:
+        tid, flags, qd = struct.unpack(">HHH", data[:6])
+        if flags & 0x8000 or qd != 1:
+            return None
+        pos, labels = 12, []
+        while pos < len(data) and data[pos]:
+            ln = data[pos]
+            if ln > 63 or pos + 1 + ln > len(data):
+                return None
+            labels.append(data[pos + 1:pos + 1 + ln].decode("ascii", "replace"))
+            pos += 1 + ln
+        pos += 1
+        if pos + 4 > len(data):
+            return None
+        qtype, qclass = struct.unpack(">HH", data[pos:pos + 4])
+        question = data[12:pos + 4]
+        name = ".".join(labels).lower()
+        if qtype != 1:  # NOERROR/NODATA for non-A queries
+            return struct.pack(">HHHHHH", tid, 0x8180, 1, 0, 0, 0) + question
+        if wanted and name not in wanted:
+            return struct.pack(">HHHHHH", tid, 0x8183, 1, 0, 0, 0) + question
+        rr = b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 30, 4) + socket.inet_aton(answer)
+        return struct.pack(">HHHHHH", tid, 0x8180, 1, 1, 0, 0) + question + rr
+    except (IndexError, struct.error, OSError, UnicodeError):
+        return None
+
+
+def dns_responder(sock: socket.socket, answer: str, names: list[str] | None) -> None:
     """Answer A queries with `answer` so the Switch's portal check lands here.
 
     Only the plain DNS subset needed for an A lookup is implemented.
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((bind, port))
-    print(f"[dns] answering A queries on {bind}:{port} -> {answer}", flush=True)
     wanted = {n.lower() for n in (names or [])}
+    print(f"[dns] answering A queries -> {answer}", flush=True)
     while True:
         data, addr = sock.recvfrom(1500)
-        try:
-            tid, flags, qd = struct.unpack(">HHH", data[:6])
-            if flags & 0x8000:  # a response, not a query
-                continue
-            pos, labels = 12, []
-            while pos < len(data) and data[pos]:
-                ln = data[pos]
-                labels.append(data[pos + 1:pos + 1 + ln].decode("ascii", "replace"))
-                pos += 1 + ln
-            name = ".".join(labels).lower()
-            pos += 1
-            qtype, qclass = struct.unpack(">HH", data[pos:pos + 4])
-            question = data[12:pos + 4]
-            if qtype != 1:  # A only; everything else gets NXDOMAIN-ish empty
-                resp = struct.pack(">HHHHHH", tid, 0x8180, 1, 0, 0, 0) + question
-                sock.sendto(resp, addr)
-                continue
-            if wanted and name not in wanted:
-                resp = struct.pack(">HHHHHH", tid, 0x8183, 1, 0, 0, 0) + question
-                sock.sendto(resp, addr)
-                continue
-            rr = b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 30, 4) + socket.inet_aton(answer)
-            resp = struct.pack(">HHHHHH", tid, 0x8180, 1, 1, 0, 0) + question + rr
+        resp = dns_answer(data, answer, wanted)
+        if resp:
             sock.sendto(resp, addr)
-        except Exception as exc:  # malformed packet: ignore, keep serving
-            print(f"[dns] bad packet from {addr}: {exc}", flush=True)
 
 
 def _qv(quality: int) -> int:
@@ -613,7 +737,7 @@ def _qv(quality: int) -> int:
     return max(1, min(31, 31 - int(quality * 0.31)))
 
 
-def default_capture_cmd(source: str, width: int, height: int, fps: int, quality: int) -> list[str]:
+def default_capture_cmd(width: int, height: int, fps: int, quality: int) -> list[str]:
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-re", "-f", "lavfi", "-i", f"testsrc=size={width}x{height}:rate={fps}",
@@ -634,7 +758,7 @@ def mac_capture_cmd(index: int, width: int, height: int, fps: int, quality: int)
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "avfoundation", "-framerate", str(fps),
         "-capture_cursor", "1", "-i", f"{index}:none",
-        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2",
         "-c:v", "mjpeg", "-q:v", str(_qv(quality)), "-f", "mjpeg", "-",
     ]
 
@@ -643,7 +767,7 @@ def x11_capture_cmd(display: str, width: int, height: int, fps: int, quality: in
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "x11grab", "-framerate", str(fps), "-i", display,
-        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2",
         "-c:v", "mjpeg", "-q:v", str(_qv(quality)), "-f", "mjpeg", "-",
     ]
 
@@ -660,13 +784,16 @@ PRESETS = {
 def resolve_capture(args) -> list[str]:
     """Turn CLI flags into the capture argv (or a shell command)."""
     if args.source:
-        return ["/bin/sh", "-c", args.source.format(
-            w=args.width, h=args.height, fps=args.fps,
-            q=args.quality, qv=_qv(args.quality))]
+        values = {"{w}": str(args.width), "{h}": str(args.height), "{fps}": str(args.fps),
+                  "{q}": str(args.quality), "{qv}": str(_qv(args.quality))}
+        source = args.source
+        for key, value in values.items():
+            source = source.replace(key, value)
+        return ["/bin/sh", "-c", source]
     preset = args.preset or "test"
     quality = args.quality
     if preset == "test":
-        return default_capture_cmd(preset, args.width, args.height, args.fps, quality)
+        return default_capture_cmd(args.width, args.height, args.fps, quality)
     if preset == "mac-mirror":
         return mac_capture_cmd(args.display_index, args.width, args.height, args.fps, quality)
     if preset == "mac-extended":
@@ -676,18 +803,25 @@ def resolve_capture(args) -> list[str]:
     raise SystemExit(f"unknown preset: {preset}")
 
 
-def _parse_size(text: str | None) -> tuple[int, int] | None:
+def _parse_size(text: str) -> tuple[int, int]:
     if not text:
-        return None
+        raise argparse.ArgumentTypeError("expected WIDTHxHEIGHT")
     w, _, h = text.lower().partition("x")
-    return (int(w), int(h))
+    try:
+        value = (int(w), int(h))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected WIDTHxHEIGHT") from exc
+    if min(value) <= 0:
+        raise argparse.ArgumentTypeError("size must be positive")
+    return value
 
 
-def _parse_xy(text: str | None, default: tuple[int, int]) -> tuple[int, int]:
-    if not text:
-        return default
+def _parse_xy(text: str) -> tuple[int, int]:
     x, _, y = text.partition(",")
-    return (int(x), int(y))
+    try:
+        return (int(x), int(y))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected X,Y") from exc
 
 
 def main() -> int:
@@ -718,13 +852,17 @@ def main() -> int:
     ap.add_argument("--click-secret", default=None,
                     help="enable tap-to-click with this shared secret "
                          "(or set SWITCHDISPLAY_SECRET); without it /click is refused")
-    ap.add_argument("--click-display-size", default=None, metavar="WxH",
+    ap.add_argument("--click-display-size", type=_parse_size, default=None, metavar="WxH",
                     help="target display size in POINTS, e.g. 1512x982 (Retina!) — "
                          "omit to map frame pixels 1:1")
-    ap.add_argument("--click-display-origin", default="0,0", metavar="X,Y",
+    ap.add_argument("--click-display-origin", type=_parse_xy, default=(0, 0), metavar="X,Y",
                     help="display origin in global screen coordinates (default 0,0)")
     ap.add_argument("--click-dry-run", action="store_true",
-                    help="log the synthesizer command instead of clicking (safe test)")
+                     help="log the synthesizer command instead of clicking (safe test)")
+    ap.add_argument("--allow-host", action="append", default=[],
+                    help="additional HTTP Host name allowed (repeatable)")
+    ap.add_argument("--click-allow", action="append", default=[], metavar="IP",
+                    help="only this client IP may click or receive the secret (repeatable)")
     args = ap.parse_args()
 
     pw, ph, pf = PRESETS[args.preset or "test"]
@@ -740,34 +878,63 @@ def main() -> int:
         print(shlex.join(cmd))
         return 0
 
-    hub = Hub(cmd)
-    hub.start()
-
-    if args.dns_port:
-        answer = args.dns_answer or _lan_ip()
-        dns_bind = args.dns_bind or answer
-        threading.Thread(target=dns_responder,
-                         args=(dns_bind, args.dns_port, answer,
-                               ["conntest.nintendowifi.net", "ctest.cdn.nintendo.net"]),
-                         daemon=True).start()
-
     from http.server import ThreadingHTTPServer
+    import socketserver
+
+    class LocalThreadingHTTPServer(ThreadingHTTPServer):
+        # HTTPServer.server_bind calls getfqdn(), which can block on an offline
+        # host; the server never needs a reverse-DNS name.
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
     secret = args.click_secret or os.environ.get("SWITCHDISPLAY_SECRET") or ""
     clicker = None
     if secret:
         clicker = Clicker(
             secret=secret,
-            display_size=_parse_size(args.click_display_size),
-            origin=_parse_xy(args.click_display_origin, (0, 0)),
+            display_size=args.click_display_size,
+            origin=args.click_display_origin,
             dry_run=args.click_dry_run,
         )
-    server = ThreadingHTTPServer((args.bind, args.port), make_handler(hub, clicker))
+    lan_ip = _lan_ip()
+    if clicker and args.bind == "0.0.0.0":
+        args.bind = lan_ip
+        print(f"[http] click enabled; binding to LAN IP {lan_ip} instead of 0.0.0.0", flush=True)
+    allowed_hosts = {"localhost", "127.0.0.1", "conntest.nintendowifi.net",
+                     "ctest.cdn.nintendo.net", lan_ip, args.bind}
+    allowed_hosts.update(h.lower().split(":", 1)[0] for h in args.allow_host)
+    dns_sock = None
+    if args.dns_port:
+        answer = args.dns_answer or lan_ip
+        dns_bind = args.dns_bind or answer
+        dns_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        dns_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        dns_sock.bind((dns_bind, args.dns_port))
+    hub = Hub(cmd)
+    server = LocalThreadingHTTPServer((args.bind, args.port),
+                                 make_handler(hub, clicker, allowed_hosts, set(args.click_allow)))
     server.daemon_threads = True
-    shown = args.bind if args.bind not in ("0.0.0.0", "::") else _lan_ip()
+    if os.geteuid() == 0 and os.environ.get("SUDO_UID"):
+        uid, gid = int(os.environ["SUDO_UID"]), int(os.environ.get("SUDO_GID", "0"))
+        try:
+            os.setgroups([])
+        except OSError:
+            pass
+        os.setgid(gid)
+        os.setuid(uid)
+        print(f"[priv] dropped privileges to uid={uid} gid={gid}", flush=True)
+    hub.start()
+    if dns_sock:
+        threading.Thread(target=dns_responder,
+                         args=(dns_sock, answer,
+                               ["conntest.nintendowifi.net", "ctest.cdn.nintendo.net"]),
+                         daemon=True).start()
+    shown = args.bind
     print(f"[http] http://{shown}:{args.port}/  (viewer, /ws, /mjpeg, /click, /health)", flush=True)
     print(f"[src ] {shlex.join(cmd)}", flush=True)
     if clicker:
-        size = clicker.display_size or "= frame size"
+        size = clicker.display_size or "frame size"
+        if clicker.display_size is None:
+            print("[click] warning: --click-display-size omitted; mapping to frame size", flush=True)
         print(f"[click] tap-to-click ON{' (DRY RUN)' if clicker.dry_run else ''} "
               f"secret=set display={size} origin={clicker.origin}", flush=True)
     else:
