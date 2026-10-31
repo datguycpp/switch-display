@@ -1,4 +1,5 @@
 import http.client
+import inspect
 import json
 import threading
 import unittest
@@ -88,6 +89,13 @@ class Tests(unittest.TestCase):
         page = switchdisplay.render_viewer(True, "a'\\</script>").decode()
         self.assertNotIn("a'\\</script>", page)
         self.assertIn("\\u003c/script\\u003e", page)
+
+    def test_pull_and_push_websocket_flow_control(self):
+        handler = inspect.getsource(switchdisplay.make_handler)
+        self.assertIn('if text == "pull":', handler)
+        self.assertIn('pull = True\n                                        # Do not wait', handler)
+        self.assertIn('requested = True', handler)
+        self.assertIn('timeout = 0.02 if not pull else 0.2', handler)
 
     def test_host_validation(self):
         hub = switchdisplay.Hub([])

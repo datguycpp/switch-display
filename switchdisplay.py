@@ -753,10 +753,15 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 pull = False
                 requested = False
                 last_sent = -1
+                last_ping = time.monotonic()
                 self.connection.setblocking(False)
                 try:
                     while True:
-                        readable, _, _ = select.select([self.connection], [], [], 0.2)
+                        # Poll frequently in push mode so delivery is not
+                        # capped by the old keepalive timeout.  The queue is
+                        # bounded to one newest frame per client.
+                        timeout = 0.02 if not pull else 0.2
+                        readable, _, _ = select.select([self.connection], [], [], timeout)
                         if readable:
                             data = self.connection.recv(4096)
                             if not data:
@@ -771,7 +776,9 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                                     text = payload.decode("ascii", "ignore")
                                     if text == "pull":
                                         pull = True
-                                        requested = False
+                                        # Do not wait for a frame that the
+                                        # viewer cannot render yet.
+                                        requested = True
                                     elif pull and text == "n":
                                         requested = True
                         frame = None
@@ -789,8 +796,9 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                                 pass
                         if frame is not None:
                             ws_send_frame(self.connection, frame)
-                        elif not pull and not readable:
+                        elif not pull and not readable and time.monotonic() - last_ping >= 10:
                             ws_ping(self.connection)
+                            last_ping = time.monotonic()
                 except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
                     pass
                 finally:
