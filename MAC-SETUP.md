@@ -1,6 +1,6 @@
-# Mac → Switch runbook (host 192.168.68.56)
+# Mac → Switch runbook (host <mac-lan-ip>)
 
-Copy-paste steps for showing Steven's Mac screen on a **stock** Switch.
+Copy-paste steps for showing a Mac screen on a **stock** Switch.
 Two modes: **(a) mirror** one Mac display, or **(b) extended** — a virtual
 display created by BetterDisplay that you drag windows onto.
 
@@ -14,7 +14,7 @@ duration, and changed back afterwards.
 | Step | How |
 |---|---|
 | **Same Wi‑Fi** | Mac and Switch on the **same 5 GHz SSID** (2.4 GHz caps bandwidth and adds latency). Router must **not** have "AP/client isolation" enabled, or the Switch cannot reach the Mac at all. |
-| **LAN IP confirmed** | `ipconfig getifaddr en0` → must print `192.168.68.56`. If it differs, use whatever it prints everywhere below. Do **not** use the Tailscale `100.87.10.17` — the Switch cannot join the tailnet. |
+| **LAN IP confirmed** | `ipconfig getifaddr en0` → note the IP it prints and use it everywhere below as `<mac-lan-ip>`. Do **not** use the Tailscale IP — the Switch cannot join the tailnet. |
 | **Python 3** | `python3 --version`. If macOS asks to install Command Line Tools, accept once. |
 | **ffmpeg** | `brew install ffmpeg` (needs Homebrew). Verify: `ffmpeg -version`. |
 | **Screen Recording permission** | System Settings → Privacy & Security → **Screen Recording** → enable **Terminal** (or iTerm/the app you launch from), then **quit and reopen** that terminal. *Without this, AVFoundation returns BLACK frames and no error.* |
@@ -43,8 +43,8 @@ sudo python3 switchdisplay.py \
   --preset mac-mirror \
   --display-index 1 \
   --width 960 --height 540 --fps 15 --quality 65 \
-  --bind 192.168.68.56 --port 8090 \
-  --dns-port 53 --dns-answer 192.168.68.56 \
+  --bind <mac-lan-ip> --port 8090 \
+  --dns-port 53 --dns-answer <mac-lan-ip> \
   --click-secret 'CHANGE-ME-to-a-long-random-string' \
   --click-display-size 1512x982
 ```
@@ -87,8 +87,8 @@ sudo python3 switchdisplay.py \
   --preset mac-extended \
   --display-index 2 \
   --width 1280 --height 720 --fps 15 --quality 65 \
-  --bind 192.168.68.56 --port 8090 \
-  --dns-port 53 --dns-answer 192.168.68.56 \
+  --bind <mac-lan-ip> --port 8090 \
+  --dns-port 53 --dns-answer <mac-lan-ip> \
   --click-secret 'CHANGE-ME-to-a-long-random-string' \
   --click-display-size 1280x720 \
   --click-display-origin 1512,0
@@ -110,7 +110,7 @@ just offset).
 1. **System Settings → Internet → Internet Settings →** your Wi‑Fi →
    **Change Settings**.
 2. **DNS Settings → Manual**:
-   * **Primary DNS `192.168.68.56`**
+   * **Primary DNS `<mac-lan-ip>`**
    * **Secondary DNS `8.8.8.8`**
    * Save.
 3. **Connect to This Network** → the test reports
@@ -149,7 +149,7 @@ Add `--click-dry-run`: the server resolves and logs the synthesizer command but
 executes nothing.
 
 ```bash
-curl -s -X POST http://192.168.68.56:8090/click \
+curl -s -X POST http://<mac-lan-ip>:8090/click \
   -H 'Content-Type: application/json' \
   -d '{"x":480,"y":270,"secret":"YOUR-SECRET"}'
 # {"ok":true,"click":{"nx":0.5,"ny":0.5,"px":756,"py":491,"tool":"cliclick","result":"dry-run",...},
@@ -162,7 +162,7 @@ A centre tap on a 960×540 frame must map to the centre of the display
 **Verify what happened**
 
 ```bash
-curl -s http://192.168.68.56:8090/health | python3 -m json.tool
+curl -s http://<mac-lan-ip>:8090/health | python3 -m json.tool
 # "clicks": {"received":N,"rejected":0,"limited":0,"synthesized":N,"bad_coords":0}
 # "last_click": {"nx":..,"ny":..,"px":..,"py":..,"tool":"cliclick","result":"clicked"}
 ```
@@ -185,12 +185,12 @@ curl -s http://192.168.68.56:8090/health | python3 -m json.tool
 On the Mac:
 
 ```bash
-curl -s http://192.168.68.56:8090/health      # frames should be climbing
-curl -s --max-time 3 http://192.168.68.56:8090/mjpeg | wc -c   # non-zero bytes
+curl -s http://<mac-lan-ip>:8090/health      # frames should be climbing
+curl -s --max-time 3 http://<mac-lan-ip>:8090/mjpeg | wc -c   # non-zero bytes
 ```
 
 On any other device on the same Wi‑Fi (phone is enough): open
-`http://192.168.68.56:8090/` — if the phone shows the screen, the Mac side is
+`http://<mac-lan-ip>:8090/` — if the phone shows the screen, the Mac side is
 good and the problem is the Switch's DNS/applet step.
 
 ### Troubleshooting
@@ -198,9 +198,9 @@ good and the problem is the Switch's DNS/applet step.
 | Symptom | Cause / fix |
 |---|---|
 | Frames are black | Screen Recording permission missing for the terminal → grant, **restart the terminal** |
-| `Address already in use` on port 53 | mDNSResponder/another resolver holds it. Either bind a different interface (`--dns-bind 192.168.68.56` is already the default when `--dns-answer` is set), or run `--dns-port 5353` and redirect with pf: `rdr on en0 inet proto udp from any to any port 53 -> 192.168.68.56 port 5353` (also add the matching `nat`/`pass` rules; `sudo pfctl -f <file> -e`) |
+| `Address already in use` on port 53 | mDNSResponder/another resolver holds it. Either bind a different interface (`--dns-bind <mac-lan-ip>` is already the default when `--dns-answer` is set), or run `--dns-port 5353` and redirect with pf: `rdr on en0 inet proto udp from any to any port 53 -> <mac-lan-ip> port 5353` (also add the matching `nat`/`pass` rules; `sudo pfctl -f <file> -e`) |
 | Switch shows "Could not connect" | Mac firewall blocked `python3`, or the router has client isolation, or Mac and Switch are on different subnets/SSIDs |
-| Stream works on the phone but not the Switch | re-check primary DNS is exactly `192.168.68.56`, secondary `8.8.8.8`, and that the applet (not a normal page) is what opened |
+| Stream works on the phone but not the Switch | re-check primary DNS is exactly `<mac-lan-ip>`, secondary `8.8.8.8`, and that the applet (not a normal page) is what opened |
 | Very low fps | expected — the Switch's WebKit has **no JIT**; drop `--width/--height` (e.g. 800×450) or `--fps 10`, or lower `--quality` |
 | Tap does nothing | Accessibility permission missing for the terminal (system → Privacy & Security → Accessibility), or `--click-secret` was not passed (page shows "view only"), or the secret in the page is stale — reload the applet |
 | Clicks land offset by a constant amount | `--click-display-size` is in **points**, not Retina pixels; for a dummy also set `--click-display-origin` |

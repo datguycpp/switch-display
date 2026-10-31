@@ -98,14 +98,14 @@ Do not build on spacedesk's HTML5 viewer — it is discontinued.
 # mirror the built-in display: 960x540, 15 fps, quality 65
 sudo python3 switchdisplay.py --preset mac-mirror --display-index 1 \
   --width 960 --height 540 --fps 15 --quality 65 \
-  --bind 192.168.68.56 --port 8090 \
-  --dns-port 53 --dns-answer 192.168.68.56
+  --bind <mac-lan-ip> --port 8090 \
+  --dns-port 53 --dns-answer <mac-lan-ip>
 
 # extended: a BetterDisplay dummy at 1280x720, captured by its index
 sudo python3 switchdisplay.py --preset mac-extended --display-index 2 \
   --width 1280 --height 720 --fps 15 --quality 65 \
-  --bind 192.168.68.56 --port 8090 \
-  --dns-port 53 --dns-answer 192.168.68.56
+  --bind <mac-lan-ip> --port 8090 \
+  --dns-port 53 --dns-answer <mac-lan-ip>
 ```
 
 Presets: `test` (built-in pattern, default), `mac-mirror`, `mac-extended`,
@@ -156,12 +156,12 @@ Extended (not mirrored) desktop: on macOS use a BetterDisplay dummy
 (MAC-SETUP.md); on Hyprland `hyprctl output create headless`; KDE Plasma has no
 user-creatable virtual output, so on KDE this is a mirror of a screen region.
 
-### On the Mac (stevens-15-inch)
+### On the host Mac
 
 Full runbook: **[MAC-SETUP.md](MAC-SETUP.md)** — prerequisites (5 GHz Wi‑Fi, `brew install ffmpeg`,
 Screen Recording permission for the terminal, firewall prompt, LAN IP
-`192.168.68.56`), both run lines, the Switch-side DNS steps (primary
-`192.168.68.56`, secondary `8.8.8.8`, portal applet, revert to Auto), and a
+`<mac-lan-ip>`), both run lines, the Switch-side DNS steps (primary
+`<mac-lan-ip>`, secondary `8.8.8.8`, portal applet, revert to Auto), and a
 symptom→cause table (black frames = missing permission, etc.).
 
 ### Pointing the Switch at it (no modding)
