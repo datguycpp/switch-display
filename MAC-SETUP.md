@@ -18,21 +18,27 @@ duration, and changed back afterwards.
 | **Python 3** | `python3 --version`. If macOS asks to install Command Line Tools, accept once. |
 | **ffmpeg** | `brew install ffmpeg` (needs Homebrew). Verify: `ffmpeg -version`. |
 | **Screen Recording permission** | System Settings → Privacy & Security → **Screen Recording** → enable **Terminal** (or iTerm/the app you launch from), then **quit and reopen** that terminal. *Without this, AVFoundation returns BLACK frames and no error.* |
-| **cliclick** (tap-to-click) | `brew install cliclick` — the click synthesizer. Fallback is `osascript`/System Events (works, less reliable). |
-| **Accessibility permission** (tap-to-click) | System Settings → Privacy & Security → **Accessibility** → enable **Terminal**, then restart it. *Without this the click is silently swallowed.* |
+| **cliclick** (tap-to-click, optional) | Not required: the server posts clicks itself through CoreGraphics (`quartz`). If `cliclick` is installed (`brew install cliclick`) it is used instead. |
+| **Accessibility permission** (tap-to-click) | System Settings → Privacy & Security → **Accessibility** → enable **Terminal**, then restart it. On startup the server checks this and, if it's missing, asks macOS to show its permission prompt. Until it's granted, taps are refused with `503 Accessibility permission missing`, and the Switch HUD shows that message. (macOS would otherwise drop the click silently.) |
 | **macOS firewall** | When `python3` first listens, macOS asks "Allow incoming network connections?" → **Allow**. If it never asked, check System Settings → Network → Firewall. |
 | **Script on the Mac** | Taildrop or `scp` `switchdisplay.py` to the Mac (single file, stdlib only, no pip). |
 
-Find the display index you need (do this once, and again after plugging/unplugging
-displays or creating a dummy):
+List your screens (do this again after plugging/unplugging displays or creating
+a dummy):
 
 ```bash
-ffmpeg -f avfoundation -list_devices true -i ""
-# [AVFoundation video devices]
-#   [0] FaceTime HD Camera
-#   [1] Capture screen 0      <-- built-in display (mirror mode)
-#   [2] Capture screen 1      <-- external or BetterDisplay dummy (extended mode)
+python3 switchdisplay.py --list-displays
+# screen  size (points)  origin (points)
+#   0     1920x1243      0,0              <-- main display (mirror mode default)
+#   1     1920x1080      1920,27          <-- external or BetterDisplay dummy
 ```
+
+Pick a screen with `--screen N`. Screens are captured by name (`Capture screen N`),
+so cameras don't get in the way. The raw AVFoundation index from
+`ffmpeg -f avfoundation -list_devices true -i ""` counts cameras first, and an
+iPhone Continuity Camera or Desk View can push the screens to index 4–5. With
+`--display-index 1` you can end up streaming a webcam. Only use `--display-index`
+if you know you need it.
 
 ---
 
@@ -41,18 +47,19 @@ ffmpeg -f avfoundation -list_devices true -i ""
 ```bash
 sudo python3 switchdisplay.py \
   --preset mac-mirror \
-  --display-index 1 \
+  --screen 0 \
   --width 960 --height 540 --fps 15 --quality 65 \
   --bind <mac-lan-ip> --port 80 \
   --dns-port 53 --dns-answer <mac-lan-ip> \
-  --click-secret 'CHANGE-ME-to-a-long-random-string' \
-  --click-display-size 1512x982
+  --click-secret 'CHANGE-ME-to-a-long-random-string'
 ```
 
-`--click-display-size` is the display size in **points** (the "Looks like
-1512 × 982" figure in System Settings → Displays, or `system_profiler
-SPDisplaysDataType`), **not** the Retina pixel size. Omit `--click-secret` and
-the page is view-only. See [Tap-to-click](#tap-to-click-optional) below.
+Tap-to-click geometry (the display's size in **points** and its global origin)
+is read from CoreGraphics for the chosen `--screen` and printed at startup
+(`[click] screen 0: 1920x1243 points at 0,0 (auto-detected)`). Pass
+`--click-display-size`/`--click-display-origin` only to override it. Omit
+`--click-secret` and the page is view-only. See
+[Tap-to-click](#tap-to-click-optional) below.
 
 `sudo` is needed to bind ports 53 and 80. The server drops to the invoking user
 after binding those sockets and before starting ffmpeg. To avoid privileged HTTP,
@@ -61,10 +68,16 @@ use `--port 8090` plus a pf TCP 80→8090 redirect.
 The resolved capture command (printed by `--print-source`, check it matches):
 
 ```
-ffmpeg -hide_banner -loglevel error -f avfoundation -framerate 15 -capture_cursor 1 \
-  -i 1:none -vf scale=960:540:force_original_aspect_ratio=decrease \
-  -c:v mjpeg -q:v 11 -f mjpeg -
+ffmpeg -hide_banner -loglevel error -f avfoundation -framerate 15 -pixel_format nv12 \
+  -capture_cursor 1 -i 'Capture screen 0:none' \
+  -vf scale=960:540:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear \
+  -fps_mode passthrough -pix_fmt yuvj420p -huffman optimal -c:v mjpeg -q:v 11 -f mjpeg -
 ```
+
+`-fps_mode passthrough` matters. Without it, ffmpeg duplicates AVFoundation
+frames up to hundreds of fps (about 680 fps measured for `-framerate 15`, roughly
+14 MB/s) and floods the Wi‑Fi link. A healthy run shows `/health` frames rising
+by about `--fps` per second.
 
 ---
 
@@ -75,31 +88,29 @@ ffmpeg -hide_banner -loglevel error -f avfoundation -framerate 15 -capture_curso
 2. Make sure macOS treats it as **extended**, not mirrored:
    System Settings → Displays → **Arrange…** → untick "Mirror displays" and
    position the dummy beside the built-in screen.
-3. Get its capture index (it is usually the last "Capture screen N"):
+3. Find its screen number (usually the last row):
 
    ```bash
-   ffmpeg -f avfoundation -list_devices true -i ""
+   python3 switchdisplay.py --list-displays
    ```
 
-4. Run it (replace `2` with the dummy's index):
+4. Run it (replace `1` with the dummy's screen number):
 
 ```bash
 sudo python3 switchdisplay.py \
   --preset mac-extended \
-  --display-index 2 \
+  --screen 1 \
   --width 1280 --height 720 --fps 15 --quality 65 \
   --bind <mac-lan-ip> --port 80 \
   --dns-port 53 --dns-answer <mac-lan-ip> \
-  --click-secret 'CHANGE-ME-to-a-long-random-string' \
-  --click-display-size 1280x720 \
-  --click-display-origin 1512,0
+  --click-secret 'CHANGE-ME-to-a-long-random-string'
 ```
 
-`--click-display-origin` is where that display starts in **global screen
-coordinates** — a dummy placed to the right of a 1512-point-wide built-in screen
-starts at `1512,0`; the primary display is always `0,0`. Get both numbers right
-or taps land on the wrong display (they will still be *inside* the click area,
-just offset).
+The dummy's size and global origin (for example `1920,27` for a screen to the
+right of a 1920-point-wide main display) are detected automatically. To override,
+pass `--click-display-size WxH --click-display-origin X,Y`. A negative origin
+(a display to the left of or above the main one) needs the `=` form:
+`--click-display-origin=-1920,0`.
 
 5. Move the windows you want on the Switch onto the dummy display; the Switch
    shows exactly that display.
@@ -132,17 +143,18 @@ keyboard** — tap-as-click only.
 
 **Setup**
 
-1. `brew install cliclick` (preferred synthesizer). Without it the server falls
-   back to `osascript` + System Events, which works but is less reliable.
+1. Nothing to install: the server posts the click through CoreGraphics
+   (`tool: "quartz"`). If `cliclick` is on PATH it is used instead.
 2. Grant **Accessibility** permission to the terminal running the server
    (System Settings → Privacy & Security → Accessibility), then restart it.
    Screen Recording (needed for capture) is a *separate* permission.
 3. Pick a long random secret and pass it with `--click-secret` (or set
    `SWITCHDISPLAY_SECRET`; the flag wins). With no secret the endpoint is
    refused and the page renders **view only**.
-4. Tell it the display geometry in **points**:
-   `--click-display-size 1512x982` (mirror) or
-   `--click-display-size 1280x720 --click-display-origin 1512,0` (dummy).
+4. Display geometry is auto-detected for the `--screen` you capture (check the
+   `[click] screen N: ... (auto-detected)` startup line). Override with
+   `--click-display-size`/`--click-display-origin` only when capturing via
+   `--display-index` or a custom `--source`.
 
 **Test it without moving the cursor first**
 
@@ -153,17 +165,20 @@ executes nothing.
 curl -s -X POST http://<mac-lan-ip>:80/click \
   -H 'Content-Type: application/json' \
   -d '{"x":480,"y":270,"secret":"YOUR-SECRET"}'
-# {"ok":true,"click":{"nx":0.5,"ny":0.5,"px":756,"py":491,"tool":"cliclick","result":"dry-run",...},
-#  "command":"/opt/homebrew/bin/cliclick c:756,491"}
+# {"ok":true,"click":{"nx":0.5755,"ny":0.5,"px":1105,"py":622,"tool":"quartz","result":"dry-run",...},
+#  "command":"CGEventPost leftclick:1105,622"}
 ```
 
-A centre tap on a 960×540 frame must map to the centre of the display
-(756,491 on 1512×982). Then drop `--click-dry-run` and tap for real.
+The frame keeps the display's aspect ratio (a 1920×1243 display becomes
+834×540), so `nx`/`ny` are relative to `frame_size` in `/health`. A tap at the
+centre of the frame must land at the centre of the display. Then drop
+`--click-dry-run` and tap for real.
 
 **Verify what happened**
 
 ```bash
 curl -s http://<mac-lan-ip>:80/health | python3 -m json.tool
+# "accessibility": true      <- false means macOS will not accept synthesized clicks
 # "clicks": {"received":N,"rejected":0,"limited":0,"synthesized":N,"bad_coords":0}
 # "last_click": {"nx":..,"ny":..,"px":..,"py":..,"tool":"cliclick","result":"clicked"}
 ```
@@ -205,12 +220,15 @@ good and the problem is the Switch's DNS/applet step.
 | Switch shows "Could not connect" | Mac firewall blocked `python3`, or the router has client isolation, or Mac and Switch are on different subnets/SSIDs |
 | Stream works on the phone but not the Switch | re-check primary DNS is exactly `<mac-lan-ip>`, secondary `8.8.8.8`, and that the applet (not a normal page) is what opened |
 | Very low fps | expected — the Switch's WebKit has **no JIT**; drop `--width/--height` (e.g. 800×450) or `--fps 10`, or lower `--quality` |
-| Tap does nothing | Accessibility permission missing for the terminal (system → Privacy & Security → Accessibility), or `--click-secret` was not passed (page shows "view only"), or the secret in the page is stale — reload the applet |
+| Tap does nothing | HUD says `Accessibility permission missing` → grant it to the terminal, restart the terminal and the server. HUD says "view only" → `--click-secret` was not passed. HUD says `bad secret` → the secret in the page is stale, reload the applet |
 | Clicks land offset by a constant amount | `--click-display-size` is in **points**, not Retina pixels; for a dummy also set `--click-display-origin` |
 | `403 bad secret` in `/health` counters | page and server secrets differ — restart the server and reload the applet |
 | Many `429` | rate limit (10 per 3 s, 80 ms apart) — that is deliberate |
-| `502` + `failed` counter climbing | `cliclick` missing or blocked; `brew install cliclick`, or install Accessibility permission |
-| Wrong screen shown | capture index changed after display changes — re-run `ffmpeg -f avfoundation -list_devices true -i ""` |
+| `503` + `failed` counter climbing | Accessibility permission missing (`"accessibility": false` in `/health`) |
+| `502` + `failed` counter climbing | the synthesizer itself errored (e.g. a broken `cliclick`); the response's `command` shows what ran |
+| Wrong screen shown | screens changed. Re-run `python3 switchdisplay.py --list-displays` and pick `--screen N` |
+| A webcam is shown instead of the screen | `--display-index` points at a camera. Drop it and use `--screen N` |
+| `/health` frames climb by hundreds per second | a custom `--source` without `-fps_mode passthrough` (the presets include it) |
 
 ### Limits
 
