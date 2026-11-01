@@ -142,6 +142,20 @@ class Tests(unittest.TestCase):
             self.assertEqual(c.synthesizer(-1920, 27)[1], ["/bin/cliclick", "c:=-1920,27"])
             self.assertEqual(c.synthesizer(10, 20)[1], ["/bin/cliclick", "c:10,20"])
 
+    def test_click_refused_without_accessibility(self):
+        c = switchdisplay.Clicker("s", None, (0, 0), False, min_gap_s=0)
+        with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=False), \
+                unittest.mock.patch("subprocess.run") as run, \
+                unittest.mock.patch.object(switchdisplay, "quartz_click") as quartz:
+            code, body = c.click("a", 1, 1, (2, 2))
+        self.assertEqual(code, 503)
+        self.assertIn("Accessibility", body["error"])
+        self.assertEqual((c.stats["failed"], c.stats["synthesized"]), (1, 0))
+        run.assert_not_called(); quartz.assert_not_called()
+        dry = switchdisplay.Clicker("s", None, (0, 0), True, min_gap_s=0)
+        with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=False):
+            self.assertEqual(dry.click("a", 1, 1, (2, 2))[0], 200)
+
     def test_mac_presets_capture_screens_by_name(self):
         args = SimpleNamespace(source=None, preset="mac-mirror", screen=None, display_index=None,
                                width=960, height=540, fps=15, quality=65, static=False)

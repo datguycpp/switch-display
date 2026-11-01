@@ -19,7 +19,7 @@ duration, and changed back afterwards.
 | **ffmpeg** | `brew install ffmpeg` (needs Homebrew). Verify: `ffmpeg -version`. |
 | **Screen Recording permission** | System Settings → Privacy & Security → **Screen Recording** → enable **Terminal** (or iTerm/the app you launch from), then **quit and reopen** that terminal. *Without this, AVFoundation returns BLACK frames and no error.* |
 | **cliclick** (tap-to-click, optional) | Not required: the server posts clicks itself through CoreGraphics (`quartz`). If `cliclick` is installed (`brew install cliclick`) it is used instead. |
-| **Accessibility permission** (tap-to-click) | System Settings → Privacy & Security → **Accessibility** → enable **Terminal**, then restart it. *Without this the click is silently swallowed.* |
+| **Accessibility permission** (tap-to-click) | System Settings → Privacy & Security → **Accessibility** → enable **Terminal**, then restart it. On startup the server checks this and, if it's missing, asks macOS to show its permission prompt. Until it's granted, taps are refused with `503 Accessibility permission missing`, and the Switch HUD shows that message. (macOS would otherwise drop the click silently.) |
 | **macOS firewall** | When `python3` first listens, macOS asks "Allow incoming network connections?" → **Allow**. If it never asked, check System Settings → Network → Firewall. |
 | **Script on the Mac** | Taildrop or `scp` `switchdisplay.py` to the Mac (single file, stdlib only, no pip). |
 
@@ -178,6 +178,7 @@ centre of the frame must land at the centre of the display. Then drop
 
 ```bash
 curl -s http://<mac-lan-ip>:80/health | python3 -m json.tool
+# "accessibility": true      <- false means macOS will not accept synthesized clicks
 # "clicks": {"received":N,"rejected":0,"limited":0,"synthesized":N,"bad_coords":0}
 # "last_click": {"nx":..,"ny":..,"px":..,"py":..,"tool":"cliclick","result":"clicked"}
 ```
@@ -219,11 +220,12 @@ good and the problem is the Switch's DNS/applet step.
 | Switch shows "Could not connect" | Mac firewall blocked `python3`, or the router has client isolation, or Mac and Switch are on different subnets/SSIDs |
 | Stream works on the phone but not the Switch | re-check primary DNS is exactly `<mac-lan-ip>`, secondary `8.8.8.8`, and that the applet (not a normal page) is what opened |
 | Very low fps | expected — the Switch's WebKit has **no JIT**; drop `--width/--height` (e.g. 800×450) or `--fps 10`, or lower `--quality` |
-| Tap does nothing | Accessibility permission missing for the terminal (system → Privacy & Security → Accessibility), or `--click-secret` was not passed (page shows "view only"), or the secret in the page is stale — reload the applet |
+| Tap does nothing | HUD says `Accessibility permission missing` → grant it to the terminal, restart the terminal and the server. HUD says "view only" → `--click-secret` was not passed. HUD says `bad secret` → the secret in the page is stale, reload the applet |
 | Clicks land offset by a constant amount | `--click-display-size` is in **points**, not Retina pixels; for a dummy also set `--click-display-origin` |
 | `403 bad secret` in `/health` counters | page and server secrets differ — restart the server and reload the applet |
 | Many `429` | rate limit (10 per 3 s, 80 ms apart) — that is deliberate |
-| `502` + `failed` counter climbing | Accessibility permission missing for the terminal (Quartz/cliclick both need it) |
+| `503` + `failed` counter climbing | Accessibility permission missing (`"accessibility": false` in `/health`) |
+| `502` + `failed` counter climbing | the synthesizer itself errored (e.g. a broken `cliclick`); the response's `command` shows what ran |
 | Wrong screen shown | screens changed. Re-run `python3 switchdisplay.py --list-displays` and pick `--screen N` |
 | A webcam is shown instead of the screen | `--display-index` points at a camera. Drop it and use `--screen N` |
 | `/health` frames climb by hundreds per second | a custom `--source` without `-fps_mode passthrough` (the presets include it) |

@@ -70,7 +70,7 @@ VIEWER_HTML = b"""<!doctype html>
   var canvas = document.getElementById('c');
   var ctx = canvas.getContext('2d');
   var url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
-  var frames = 0, last = new Date().getTime(), taps = 0;
+  var frames = 0, last = new Date().getTime(), taps = 0, tapError = '';
   window.__frames = 0;
   window.__taps = 0;
   window.__mode = 'none';
@@ -95,7 +95,8 @@ VIEWER_HTML = b"""<!doctype html>
     var now = new Date().getTime();
     var fps = frames * 1000 / Math.max(1, now - last);
     hud.textContent = window.__mode + ' ' + Math.round(fps) + ' fps' +
-      (CLICK_ON ? ' \\u00b7 taps ' + taps : ' \\u00b7 view only');
+      (CLICK_ON ? ' \\u00b7 taps ' + taps : ' \\u00b7 view only') +
+      (tapError ? ' \\u00b7 ' + tapError : '');
     if (now - last > 2000) { frames = 0; last = now; }
   }
   window.setInterval(hudUpdate, 500);
@@ -211,6 +212,13 @@ VIEWER_HTML = b"""<!doctype html>
     var xhr = new XMLHttpRequest();
     xhr.open('POST', '/click', true);
     xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) return;
+      if (xhr.status === 200 || xhr.status === 429) { tapError = ''; return; }
+      var msg = 'tap failed (' + xhr.status + ')';
+      try { msg = JSON.parse(xhr.responseText).error || msg; } catch (e) {}
+      tapError = msg;
+    };
     xhr.send(JSON.stringify({
       x: Math.round(fx), y: Math.round(fy), secret: CLICK_SECRET
     }));
@@ -355,6 +363,49 @@ def mac_displays() -> list[dict]:
     return out
 
 
+ACCESSIBILITY_HELP = ("grant Accessibility to the app that launched the server: System Settings "
+                      "> Privacy & Security > Accessibility > enable Terminal (or your terminal), "
+                      "then quit and reopen it")
+
+
+def accessibility_trusted(prompt: bool = False) -> bool | None:
+    """macOS: may this process post input events? None off macOS.
+
+    Without the permission macOS drops synthesized clicks silently, so this is
+    the only way to tell "clicked" from "nothing happened". With prompt=True
+    macOS shows its own dialog offering to open the Accessibility settings.
+    """
+    if sys.platform != "darwin":
+        return None
+    import ctypes
+    try:
+        ax = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/"
+                         "ApplicationServices")
+        if not prompt:
+            ax.AXIsProcessTrusted.restype = ctypes.c_bool
+            return bool(ax.AXIsProcessTrusted())
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        cf.CFDictionaryCreate.restype = ctypes.c_void_p
+        cf.CFDictionaryCreate.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+                                          ctypes.POINTER(ctypes.c_void_p), ctypes.c_long,
+                                          ctypes.c_void_p, ctypes.c_void_p]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        keys = (ctypes.c_void_p * 1)(ctypes.c_void_p.in_dll(ax, "kAXTrustedCheckOptionPrompt").value)
+        values = (ctypes.c_void_p * 1)(ctypes.c_void_p.in_dll(cf, "kCFBooleanTrue").value)
+        options = cf.CFDictionaryCreate(
+            None, keys, values, 1,
+            ctypes.addressof(ctypes.c_char.in_dll(cf, "kCFTypeDictionaryKeyCallBacks")),
+            ctypes.addressof(ctypes.c_char.in_dll(cf, "kCFTypeDictionaryValueCallBacks")))
+        ax.AXIsProcessTrustedWithOptions.restype = ctypes.c_bool
+        ax.AXIsProcessTrustedWithOptions.argtypes = [ctypes.c_void_p]
+        try:
+            return bool(ax.AXIsProcessTrustedWithOptions(options))
+        finally:
+            cf.CFRelease(options)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def quartz_click(px: int, py: int) -> None:
     """One left click at global point (px, py) via CGEvent (needs Accessibility)."""
     q = _coregraphics()
@@ -452,6 +503,11 @@ class Clicker:
         tool, argv = self.synthesizer(px, py)
         if self.dry_run:
             result = "dry-run"
+        elif accessibility_trusted() is False:
+            # macOS would swallow the click and we would report success
+            with self._lock:
+                self.stats["failed"] += 1
+            return 503, {"error": "Accessibility permission missing", "fix": ACCESSIBILITY_HELP}
         else:
             try:
                 if tool == "quartz":
@@ -863,6 +919,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                     "clicks": clicker.stats if clicker else None,
                     "clicks_enabled": clicker is not None,
                     "last_click": clicker.last_click if clicker else None,
+                    "accessibility": accessibility_trusted() if clicker else None,
                 }).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1279,6 +1336,9 @@ def main() -> int:
             print("[click] warning: --click-display-size omitted; mapping to frame size", flush=True)
         print(f"[click] tap-to-click ON{' (DRY RUN)' if clicker.dry_run else ''} "
               f"secret=set display={size} origin={clicker.origin}", flush=True)
+        if not clicker.dry_run and accessibility_trusted(prompt=True) is False:
+            print(f"[click] warning: taps will be refused until you {ACCESSIBILITY_HELP}. "
+                  "macOS has been asked to show its permission prompt.", flush=True)
     else:
         print("[click] tap-to-click OFF (no --click-secret / SWITCHDISPLAY_SECRET)", flush=True)
     def _terminate(signum, frame):
