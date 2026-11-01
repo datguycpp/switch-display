@@ -6,6 +6,7 @@ import socket
 import threading
 import time
 import unittest
+import unittest.mock
 import struct
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
@@ -65,6 +66,8 @@ class Tests(unittest.TestCase):
         mac = switchdisplay.mac_capture_cmd(1, 960, 540, 15, 65, True)
         vf = mac[mac.index("-vf") + 1]
         self.assertLess(vf.index("scale="), vf.index("mpdecimate"))
+        # without passthrough ffmpeg duplicates AVFoundation frames to ~680 fps
+        self.assertEqual(mac[mac.index("-fps_mode") + 1], "passthrough")
 
     def test_profile_sizes_and_explicit_override(self):
         self.assertEqual((1280, 720), {"sharp": (1280, 720),
@@ -116,6 +119,44 @@ class Tests(unittest.TestCase):
             self.assertIsNotNone(client.queue.get_nowait())
         finally:
             hub.remove_client(client)
+
+    def test_publish_keeps_newest_frame_and_keeps_waking(self):
+        hub = switchdisplay.Hub([])
+        client = hub.add_client()
+        try:
+            frame = lambda tag: b"\xff\xd8" + tag * 64 + b"\xff\xd9"
+            hub._publish(frame(b"a"))
+            hub._publish(frame(b"b"))
+            self.assertEqual(client.queue.get_nowait(), frame(b"b"))
+            # pull mode never drains the queue; publishes must still wake it
+            hub._publish(frame(b"c"))
+            client.drain_wakeup()
+            hub._publish(frame(b"d"))
+            self.assertTrue(select.select([client.wakeup_fd], [], [], 0.1)[0])
+        finally:
+            hub.remove_client(client)
+
+    def test_cliclick_absolute_negative_coordinates(self):
+        c = switchdisplay.Clicker("s", None, (0, 0), True)
+        with unittest.mock.patch("shutil.which", return_value="/bin/cliclick"):
+            self.assertEqual(c.synthesizer(-1920, 27)[1], ["/bin/cliclick", "c:=-1920,27"])
+            self.assertEqual(c.synthesizer(10, 20)[1], ["/bin/cliclick", "c:10,20"])
+
+    def test_mac_presets_capture_screens_by_name(self):
+        args = SimpleNamespace(source=None, preset="mac-mirror", screen=None, display_index=None,
+                               width=960, height=540, fps=15, quality=65, static=False)
+        self.assertIn("Capture screen 0:none", switchdisplay.resolve_capture(args))
+        args.preset = "mac-extended"
+        self.assertIn("Capture screen 1:none", switchdisplay.resolve_capture(args))
+        args.screen = 2
+        self.assertIn("Capture screen 2:none", switchdisplay.resolve_capture(args))
+        args.display_index = 5
+        self.assertIn("5:none", switchdisplay.resolve_capture(args))
+
+    def test_viewer_frees_replaced_images(self):
+        page = switchdisplay.VIEWER_HTML.decode()
+        self.assertIn("old.parentNode.removeChild(old)", page)
+        self.assertNotIn("mediaEl = canvas;\n           fit();", page)
 
     def test_nonblocking_websocket_send_preserves_large_frames(self):
         server, reader = socket.socketpair()

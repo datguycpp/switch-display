@@ -39,6 +39,7 @@ import threading
 import time
 import signal
 import select
+from types import SimpleNamespace
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -129,47 +130,51 @@ VIEWER_HTML = b"""<!doctype html>
        ws.onopen = function () { hud.textContent = window.__mode + ' open';
          if (wantedMode === 'pull') ws.send('pull'); };
        ws.onmessage = function (ev) {
-        gotMessage = true;
-        frames++;
+        if (!gotMessage) { gotMessage = true; window.__wsAttempts = 0; }
         if (window.__decoding) {
           window.__pending = ev.data;
           return;
         }
         decode(ev.data);
       };
-       function decode(data) {
+      function done() {
+        if (wantedMode === 'pull' && ws.readyState === 1) ws.send('n');
+        window.__decoding = false;
+        if (window.__pending) { var next = window.__pending; window.__pending = null; decode(next); }
+      }
+      function decode(data) {
         window.__decoding = true;
         var blob = new Blob([data], { type: 'image/jpeg' });
         var u = window.URL.createObjectURL(blob);
         var img = new Image();
         img.onload = function () {
-           if (wantedMode === 'img' || wantedMode === 'pull') {
-             var old = mediaEl, shown = img;
-             shown.style.display = 'block';
-             document.getElementById('wrap').appendChild(shown);
-             canvas.style.display = 'none';
-             shown.width = img.width; shown.height = img.height;
-             mediaEl = shown; fit();
-             if (old && old !== canvas && old !== shown) { if (old.__url) window.URL.revokeObjectURL(old.__url);
-               if (old.parentNode) old.parentNode.removeChild(old); }
-             shown.__url = u;
-           } else if (canvas.width !== img.width || canvas.height !== img.height) {
-            canvas.width = img.width; canvas.height = img.height;
+          if (wantedMode === 'img' || wantedMode === 'pull') {
+            // swap <img> elements; the previous one and its blob URL are freed
+            var old = mediaEl;
+            img.__url = u;
+            document.getElementById('wrap').appendChild(img);
+            canvas.style.display = 'none';
+            mediaEl = img; fit();
+            if (old && old !== canvas && old !== img) {
+              if (old.__url) window.URL.revokeObjectURL(old.__url);
+              if (old.parentNode) old.parentNode.removeChild(old);
+            }
+          } else {
+            var resized = canvas.width !== img.width || canvas.height !== img.height;
+            if (resized) { canvas.width = img.width; canvas.height = img.height; }
+            ctx.drawImage(img, 0, 0);
+            window.URL.revokeObjectURL(u);
+            if (resized || mediaEl !== canvas) { mediaEl = canvas; fit(); }
           }
-          ctx.drawImage(img, 0, 0);
-           if (wantedMode !== 'img' && wantedMode !== 'pull') window.URL.revokeObjectURL(u);
-           mediaEl = canvas;
-           fit();
-           window.__frames++;
-           if (wantedMode === 'pull' && ws.readyState === 1) ws.send('n');
-           window.__decoding = false;
-           if (window.__pending) { var next = window.__pending; window.__pending = null; decode(next); }
-         };
-         img.onerror = function () {
-           window.URL.revokeObjectURL(u); window.__decoding = false;
-           if (window.__pending) { var next = window.__pending; window.__pending = null; decode(next); }
-         };
-         img.src = u;
+          frames++;
+          window.__frames++;
+          done();
+        };
+        img.onerror = function () {
+          window.URL.revokeObjectURL(u);
+          done();
+        };
+        img.src = u;
       }
        ws.onclose = function () {
         if (!gotMessage && attempts >= 3) { mjpegFallback(); return; }
@@ -290,6 +295,81 @@ def jpeg_size(data: bytes) -> tuple[int, int] | None:
     return None
 
 
+def _coregraphics():
+    """CoreGraphics via ctypes (macOS only), or None. Keeps the script stdlib-only."""
+    if sys.platform != "darwin":
+        return None
+    import ctypes
+    import ctypes.util
+
+    class CGPoint(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+    class CGSize(ctypes.Structure):
+        _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+    class CGRect(ctypes.Structure):
+        _fields_ = [("origin", CGPoint), ("size", CGSize)]
+
+    try:
+        cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics") or
+                         "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation") or
+                         "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    except OSError:
+        return None
+    cg.CGGetActiveDisplayList.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+                                          ctypes.POINTER(ctypes.c_uint32)]
+    cg.CGGetActiveDisplayList.restype = ctypes.c_int32
+    cg.CGDisplayBounds.argtypes = [ctypes.c_uint32]
+    cg.CGDisplayBounds.restype = CGRect
+    cg.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, CGPoint, ctypes.c_uint32]
+    cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+    cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+    cg.CGEventPost.restype = None
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    cf.CFRelease.restype = None
+    return SimpleNamespace(cg=cg, cf=cf, CGPoint=CGPoint, ctypes=ctypes)
+
+
+def mac_displays() -> list[dict]:
+    """Active displays in AVFoundation "Capture screen N" order.
+
+    ffmpeg's avfoundation input numbers screens in CGGetActiveDisplayList order,
+    so entry N here is "Capture screen N". Bounds are global points with a
+    top-left origin — exactly what cliclick and CGEvent expect.
+    """
+    q = _coregraphics()
+    if q is None:
+        return []
+    ids = (q.ctypes.c_uint32 * 16)()
+    count = q.ctypes.c_uint32(0)
+    if q.cg.CGGetActiveDisplayList(16, ids, q.ctypes.byref(count)) != 0:
+        return []
+    out = []
+    for i in range(count.value):
+        b = q.cg.CGDisplayBounds(ids[i])
+        out.append({"screen": i, "id": ids[i],
+                    "origin": (int(b.origin.x), int(b.origin.y)),
+                    "size": (int(b.size.width), int(b.size.height))})
+    return out
+
+
+def quartz_click(px: int, py: int) -> None:
+    """One left click at global point (px, py) via CGEvent (needs Accessibility)."""
+    q = _coregraphics()
+    if q is None:
+        raise OSError("CoreGraphics unavailable")
+    point = q.CGPoint(px, py)
+    # move, down, up: the move makes hover-sensitive targets see the pointer first
+    for kind in (5, 1, 2):  # kCGEventMouseMoved, LeftMouseDown, LeftMouseUp
+        event = q.cg.CGEventCreateMouseEvent(None, kind, point, 0)
+        if not event:
+            raise OSError("CGEventCreateMouseEvent failed")
+        q.cg.CGEventPost(0, event)  # kCGHIDEventTap
+        q.cf.CFRelease(event)
+
+
 class Clicker:
     """Tap-to-click: validate a shared secret, rate-limit, synthesise one left click.
 
@@ -338,7 +418,12 @@ class Clicker:
     def synthesizer(self, px: int, py: int) -> tuple[str, list[str]]:
         cliclick = shutil.which("cliclick")
         if cliclick:
-            return "cliclick", [cliclick, f"c:{px},{py}"]
+            # cliclick reads a leading '-' as relative; '=' forces absolute, which
+            # matters for displays left of or above the main one
+            fmt = lambda v: f"={v}" if v < 0 else str(v)
+            return "cliclick", [cliclick, f"c:{fmt(px)},{fmt(py)}"]
+        if _coregraphics() is not None:
+            return "quartz", ["CGEventPost", f"leftclick:{px},{py}"]
         script = f'tell application "System Events" to click at {{{px}, {py}}}'
         return "osascript", ["osascript", "-e", script]
 
@@ -369,8 +454,11 @@ class Clicker:
             result = "dry-run"
         else:
             try:
-                subprocess.run(argv, check=True, timeout=3,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if tool == "quartz":
+                    quartz_click(px, py)
+                else:
+                    subprocess.run(argv, check=True, timeout=3,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 result = "clicked"
             except (OSError, subprocess.SubprocessError) as exc:
                 with self._lock:
@@ -480,14 +568,7 @@ class Hub:
             self.frame_id += 1
             clients = list(self.clients)
         for client in clients:
-            try:
-                client.queue.put_nowait(frame)
-                try:
-                    client.wakeup_write.send(b"\0")
-                except (BlockingIOError, OSError):
-                    pass  # already signalled; the queue still has a frame
-            except queue.Full:
-                pass  # drop: the newest frame matters, not every frame
+            client.offer(frame)
 
     def add_client(self) -> "Client":
         client = Client()
@@ -523,6 +604,25 @@ class Client:
         self.wakeup_fd, self.wakeup_write = socket.socketpair()
         self.wakeup_fd.setblocking(False)
         self.wakeup_write.setblocking(False)
+
+    def offer(self, frame: bytes) -> None:
+        """Replace any unsent frame with this newer one, then wake the consumer.
+
+        The wakeup is sent even when nobody drains the queue (pull mode reads
+        hub.latest instead), so a full queue never silences publish signals.
+        """
+        try:
+            self.queue.get_nowait()  # stale: the newest frame matters, not every frame
+        except queue.Empty:
+            pass
+        try:
+            self.queue.put_nowait(frame)
+        except queue.Full:
+            pass  # the consumer refilled it between the two calls; still fresh
+        try:
+            self.wakeup_write.send(b"\0")
+        except (BlockingIOError, OSError):
+            pass  # already signalled
 
     def drain_wakeup(self) -> None:
         while True:
@@ -926,19 +1026,23 @@ def mac_capture_cmd(index: int, width: int, height: int, fps: int, quality: int,
                     static: bool = False) -> list[str]:
     """macOS: AVFoundation screen device -> MJPEG on stdout.
 
-    `index` is the AVFoundation video device index of the display, as printed by
-    `ffmpeg -f avfoundation -list_devices true -i ""` — "Capture screen 0" is
-    usually 1, and a BetterDisplay dummy shows up as the next index.
+    `index` is an AVFoundation video device: a name such as "Capture screen 0"
+    (what --screen produces; stable) or the numeric index printed by
+    `ffmpeg -f avfoundation -list_devices true -i ""` (shifts whenever a camera,
+    iPhone Continuity Camera or Desk View appears ahead of the screens).
     Requires Screen Recording permission for the calling terminal, else frames
     come out black with no error.
     """
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "avfoundation", "-framerate", str(fps),
+        "-f", "avfoundation", "-framerate", str(fps), "-pixel_format", "nv12",
         "-capture_cursor", "1", "-i", f"{index}:none",
         "-vf", (f"scale={width}:{height}:force_original_aspect_ratio=decrease:"
                 f"force_divisible_by=2:flags=fast_bilinear" +
                 (",mpdecimate,setpts=N/FRAME_RATE/TB" if static else "")),
+        # passthrough: the default CFR mode duplicates AVFoundation frames to
+        # hundreds of fps (measured ~680 fps for -framerate 15), flooding Wi-Fi
+        "-fps_mode", "passthrough",
         "-pix_fmt", "yuvj420p", "-huffman", "optimal",
         "-c:v", "mjpeg", "-q:v", str(_qv(quality)), "-f", "mjpeg", "-",
     ]
@@ -980,13 +1084,41 @@ def resolve_capture(args) -> list[str]:
     quality = args.quality
     if preset == "test":
         return default_capture_cmd(args.width, args.height, args.fps, quality, getattr(args, "static", False))
-    if preset == "mac-mirror":
-        return mac_capture_cmd(args.display_index, args.width, args.height, args.fps, quality, getattr(args, "static", False))
-    if preset == "mac-extended":
-        return mac_capture_cmd(args.display_index, args.width, args.height, args.fps, quality, getattr(args, "static", False))
+    if preset in ("mac-mirror", "mac-extended"):
+        return mac_capture_cmd(_mac_device(args), args.width, args.height, args.fps, quality, getattr(args, "static", False))
     if preset == "x11":
         return x11_capture_cmd(args.display, args.width, args.height, args.fps, quality, getattr(args, "static", False))
     raise SystemExit(f"unknown preset: {preset}")
+
+
+def _mac_screen(args) -> int | None:
+    """The "Capture screen N" a mac preset captures, or None for a raw --display-index."""
+    if getattr(args, "display_index", None) is not None:
+        return None
+    screen = getattr(args, "screen", None)
+    if screen is None:
+        screen = 1 if args.preset == "mac-extended" else 0
+    return screen
+
+
+def _mac_device(args) -> str | int:
+    screen = _mac_screen(args)
+    return args.display_index if screen is None else f"Capture screen {screen}"
+
+
+def list_displays() -> int:
+    displays = mac_displays()
+    if not displays:
+        print("no CoreGraphics displays (macOS only)")
+        return 1
+    print("screen  size (points)  origin (points)")
+    for d in displays:
+        size = "%dx%d" % d["size"]
+        origin = "%d,%d" % d["origin"]
+        print(f"  {d['screen']:<5} {size:<14} {origin}")
+    print("\nPick one with --screen N (mac-mirror defaults to 0, mac-extended to 1);"
+          "\ntap-to-click size/origin are taken from this table automatically.")
+    return 0
 
 
 def _parse_size(text: str) -> tuple[int, int]:
@@ -1021,9 +1153,14 @@ def main() -> int:
     ap.add_argument("--source", default=None,
                     help="explicit capture command writing JPEG to stdout; placeholders "
                          "{w} {h} {fps} {q} (1..100) {qv} (ffmpeg -q:v 1..31)")
-    ap.add_argument("--display-index", type=int, default=1,
-                    help="AVFoundation screen device index for the mac presets "
-                         "(see: ffmpeg -f avfoundation -list_devices true -i \"\")")
+    ap.add_argument("--screen", type=int, default=None,
+                    help="mac presets: capture \"Capture screen N\" (default 0 for "
+                         "mac-mirror, 1 for mac-extended); see --list-displays")
+    ap.add_argument("--display-index", type=int, default=None,
+                    help="mac presets: raw AVFoundation device index instead of --screen "
+                         "(cameras shift it; prefer --screen)")
+    ap.add_argument("--list-displays", action="store_true",
+                    help="macOS: list screens with their size/origin in points and exit")
     ap.add_argument("--display", default=":0.0", help="X11 display for the x11 preset")
     ap.add_argument("--width", type=int, default=None)
     ap.add_argument("--height", type=int, default=None)
@@ -1045,8 +1182,9 @@ def main() -> int:
     ap.add_argument("--click-display-size", type=_parse_size, default=None, metavar="WxH",
                     help="target display size in POINTS, e.g. 1512x982 (Retina!) — "
                          "omit to map frame pixels 1:1")
-    ap.add_argument("--click-display-origin", type=_parse_xy, default=(0, 0), metavar="X,Y",
-                    help="display origin in global screen coordinates (default 0,0)")
+    ap.add_argument("--click-display-origin", type=_parse_xy, default=None, metavar="X,Y",
+                    help="display origin in global screen coordinates (default 0,0; "
+                         "negative needs the = form: --click-display-origin=-1920,0)")
     ap.add_argument("--click-dry-run", action="store_true",
                      help="log the synthesizer command instead of clicking (safe test)")
     ap.add_argument("--allow-host", action="append", default=[],
@@ -1054,6 +1192,8 @@ def main() -> int:
     ap.add_argument("--click-allow", action="append", default=[], metavar="IP",
                     help="only this client IP may click or receive the secret (repeatable)")
     args = ap.parse_args()
+    if args.list_displays:
+        return list_displays()
 
     pw, ph, pf = PRESETS[args.preset or "test"]
     if args.profile:
@@ -1081,10 +1221,22 @@ def main() -> int:
     secret = args.click_secret or os.environ.get("SWITCHDISPLAY_SECRET") or ""
     clicker = None
     if secret:
+        size, origin = args.click_display_size, args.click_display_origin
+        screen = _mac_screen(args) if args.preset in ("mac-mirror", "mac-extended") else None
+        if screen is not None and size is None:
+            match = [d for d in mac_displays() if d["screen"] == screen]
+            if match:
+                size = match[0]["size"]
+                origin = match[0]["origin"] if origin is None else origin
+                print(f"[click] screen {screen}: {size[0]}x{size[1]} points at "
+                      f"{origin[0]},{origin[1]} (auto-detected)", flush=True)
+            else:
+                print(f"[click] warning: screen {screen} not found; see --list-displays",
+                      flush=True)
         clicker = Clicker(
             secret=secret,
-            display_size=args.click_display_size,
-            origin=args.click_display_origin,
+            display_size=size,
+            origin=origin or (0, 0),
             dry_run=args.click_dry_run,
         )
     lan_ip = _lan_ip()
@@ -1129,6 +1281,10 @@ def main() -> int:
               f"secret=set display={size} origin={clicker.origin}", flush=True)
     else:
         print("[click] tap-to-click OFF (no --click-secret / SWITCHDISPLAY_SECRET)", flush=True)
+    def _terminate(signum, frame):
+        raise KeyboardInterrupt  # run the finally below: ffmpeg is in its own session
+    signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGHUP, _terminate)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -76,14 +76,17 @@ prototype. For interactive/low-latency use, Sunshine + Moonlight-NX (modded).
 [MAC-SETUP.md](MAC-SETUP.md).** Short version:
 
 ```bash
-# mirror the built-in display: 960x540, 15 fps, quality 65
-sudo python3 switchdisplay.py --preset mac-mirror --display-index 1 \
+# which screens exist (size/origin in points)
+python3 switchdisplay.py --list-displays
+
+# mirror the main display: 960x540, 15 fps, quality 65
+sudo python3 switchdisplay.py --preset mac-mirror --screen 0 \
   --width 960 --height 540 --fps 15 --quality 65 \
   --bind <mac-lan-ip> --port 8090 \
   --dns-port 53 --dns-answer <mac-lan-ip>
 
-# extended: a BetterDisplay dummy at 1280x720, captured by its index
-sudo python3 switchdisplay.py --preset mac-extended --display-index 2 \
+# extended: a BetterDisplay dummy at 1280x720, captured by its screen number
+sudo python3 switchdisplay.py --preset mac-extended --screen 1 \
   --width 1280 --height 720 --fps 15 --quality 65 \
   --bind <mac-lan-ip> --port 8090 \
   --dns-port 53 --dns-answer <mac-lan-ip>
@@ -123,14 +126,15 @@ no keyboard. Enabled only when a shared secret is supplied:
 
 ```bash
 --click-secret 'long-random-string'        # or SWITCHDISPLAY_SECRET
---click-display-size 1512x982              # display size in POINTS (Retina!)
---click-display-origin 1512,0              # dummy placed right of a 1512-wide screen
 --click-dry-run                            # resolve + log the click, execute nothing
+# mac presets auto-detect the --screen's size/origin in points; override with:
+--click-display-size 1280x720 --click-display-origin 1920,27
 ```
 
-Synthesizer: `cliclick` if installed (`brew install cliclick`), else
-`osascript`/System Events. Both need **Accessibility** permission for the
-terminal (capture needs **Screen Recording** — separate permission). Without a
+Synthesizer: `cliclick` if installed, otherwise a CoreGraphics `CGEvent` posted
+directly (`quartz`, no install needed), with `osascript` as a last resort if
+CoreGraphics can't be loaded. All of them need **Accessibility** permission for the terminal
+(capture needs **Screen Recording**, which is a separate permission). Without a
 secret `/click` returns 403 and the page renders view-only.
 
 ### Custom capture (`--source`)
