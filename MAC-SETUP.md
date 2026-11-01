@@ -198,6 +198,69 @@ curl -s http://<mac-lan-ip>:80/health | python3 -m json.tool
 
 ---
 
+## Joy-Con controls (optional)
+
+Add `--keys` (it needs `--click-secret`) to turn Switch input into Mac key
+presses, for example WASD to walk around in a game:
+
+```bash
+sudo python3 switchdisplay.py --preset mac-mirror --screen 0 \
+  --bind <mac-lan-ip> --port 80 --dns-port 53 --dns-answer <mac-lan-ip> \
+  --click-secret "$(openssl rand -hex 16)" --keys
+```
+
+| Switch input | Name | Default Mac key |
+|---|---|---|
+| Stick / D-pad / touch stick up, left, down, right | `up` `left` `down` `right` | W A S D |
+| A, B, X, Y | `btn-a` `btn-b` `btn-x` `btn-y` | Space, E, F, R |
+| L, R, ZL, ZR | `btn-l` `btn-r` `btn-zl` `btn-zr` | Q, Tab, Shift, Ctrl |
+| +, − | `btn-plus` `btn-minus` | Escape, M |
+| Enter (what the applet may send for A) | `enter` | Return |
+| USB keyboard letters/digits | `w`, `7`, … | the same key |
+| Any other key code | `k<code>`, e.g. `k113` | not mapped |
+
+Remap with `--keymap 'btn-a=e,enter=space'` (repeatable; `name=none` unmaps).
+Mac key names: letters, digits, `space return tab escape delete shift ctrl
+option up down left right minus equal comma period slash semicolon quote
+bracketleft bracketright backslash grave`. Command can't be mapped, so a stray
+press can never send Cmd+Q.
+
+**Two ways to send input**
+
+* **Joy-Cons:** press buttons while the viewer is open. What the Switch's
+  browser passes to the page isn't documented, so check what arrives (below).
+* **Touch pad (handheld):** tap **pad** at the top right. A stick appears
+  bottom-left and A/B/X/Y bottom-right; they work with several fingers at once
+  and never send taps. Tap **pad** again to hide it (that releases everything).
+
+**Find out what each Joy-Con button sends.** Press each button once with the
+viewer open, then check any of these:
+
+* the HUD on the Switch, e.g. `keys key up+` or `keys key k113-`. A trailing
+  `gp` means the browser has the Gamepad API, and buttons then show as
+  `pad0 btn-a+`.
+* the server log: `[keys] unmapped input 'k113' (map it with --keymap k113=KEY)`
+* `curl -s http://<mac-lan-ip>:80/health`, whose `"input": {"seen": {...}}`
+  counts every name received
+
+Then map what you found, for example `--keymap k113=space`. A button the
+browser keeps for itself (Home always, possibly B for "back") never reaches
+the page.
+
+**Safety:** keys go through the same secret as taps, and only keys in the
+keymap can be pressed. While held, the page re-sends each key every 500 ms.
+A key not refreshed for 1.5 s, or whose connection closes, is released, so
+leaving the applet or losing Wi‑Fi can't leave W held down. Like taps, keys
+need **Accessibility** permission. Without it they're refused and the HUD says
+so.
+
+**Games:** this suits games that read the keyboard normally (most browser,
+indie and many Steam games). Some games read raw HID devices and ignore
+synthesized keys. There's no mouse-look: camera control in 3D games still
+needs the mouse or keys mapped to turning.
+
+---
+
 ## Verify before blaming the Switch
 
 On the Mac:
@@ -225,6 +288,9 @@ good and the problem is the Switch's DNS/applet step.
 | `403 bad secret` in `/health` counters | page and server secrets differ — restart the server and reload the applet |
 | Many `429` | rate limit (10 per 3 s, 80 ms apart) — that is deliberate |
 | `503` + `failed` counter climbing | Accessibility permission missing (`"accessibility": false` in `/health`) |
+| Joy-Con buttons do nothing | Check the HUD and `/health` `input.seen`. Nothing arriving means the browser keeps that button; use the touch pad. `k<code>` arriving means it isn't mapped: add `--keymap k<code>=KEY` |
+| HUD shows `keys...` | the `/input` socket is reconnecting; check that the server was started with `--keys` |
+| A key stays held in the game | it releases within 1.5 s by itself. If it doesn't, check `/health` `input.held` and report it |
 | `502` + `failed` counter climbing | the synthesizer itself errored (e.g. a broken `cliclick`); the response's `command` shows what ran |
 | Wrong screen shown | screens changed. Re-run `python3 switchdisplay.py --list-displays` and pick `--screen N` |
 | A webcam is shown instead of the screen | `--display-index` points at a camera. Drop it and use `--screen N` |
@@ -235,8 +301,8 @@ good and the problem is the Switch's DNS/applet step.
 * **Mirror** shows one whole display; **extended** needs BetterDisplay (macOS has
   no built-in user-creatable virtual display).
 * **One session at a time**; the applet is modal and ends when you leave it.
-* **Tap = one left click.** No drag, no hover, no right click, no keyboard — by
-  design, so it stays useful for presentations and media control without turning
-  the Switch into a half-broken KVM. For full input and low latency use
-  Sunshine (Mac) + Moonlight-NX (Switch, requires homebrew).
+* **Tap = one left click.** No drag, no hover, no right click. Keys only with
+  `--keys`, and then only the keys in the keymap. For full input (mouse-look,
+  analog sticks) and low latency use Sunshine (Mac) + Moonlight-NX (Switch,
+  requires homebrew).
 * Everything stays on the LAN; nothing is sent off-machine.

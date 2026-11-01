@@ -57,20 +57,43 @@ VIEWER_HTML = b"""<!doctype html>
    background:rgba(0,0,0,.45);border:1px solid #4a4;border-radius:4px;padding:2px 8px}
  .dot{position:fixed;width:18px;height:18px;margin:-9px 0 0 -9px;border-radius:9px;
    background:rgba(0,255,128,.55);pointer-events:none;z-index:2}
+ #padbtn{position:fixed;right:48px;top:6px;z-index:3;font:14px monospace;color:#8f8;display:none;
+   background:rgba(0,0,0,.45);border:1px solid #4a4;border-radius:4px;padding:2px 8px}
+ #pad{display:none}
+ #stick{position:fixed;left:24px;bottom:24px;width:150px;height:150px;border-radius:75px;z-index:3;
+   background:rgba(255,255,255,.10);border:2px solid rgba(136,255,136,.45)}
+ #knob{position:absolute;left:50px;top:50px;width:50px;height:50px;border-radius:25px;
+   background:rgba(136,255,136,.45)}
+ .pb{position:fixed;width:58px;height:58px;border-radius:29px;z-index:3;font:bold 20px sans-serif;
+   line-height:58px;text-align:center;color:#cfc;background:rgba(255,255,255,.10);
+   border:2px solid rgba(136,255,136,.45)}
+ .pb.on{background:rgba(136,255,136,.55);color:#000}
 </style></head>
 <body>
 <div id="wrap"><canvas id="c"></canvas></div>
 <div id="hud">connecting...</div>
-<div id="fs">&#9974;</div>
+<div id="fs" class="ui">&#9974;</div>
+<div id="padbtn" class="ui">pad</div>
+<div id="pad" class="ui">
+ <div id="stick" class="ui"><div id="knob" class="ui"></div></div>
+ <div class="pb ui" data-btn="btn-x" style="right:88px;bottom:148px">X</div>
+ <div class="pb ui" data-btn="btn-y" style="right:152px;bottom:86px">Y</div>
+ <div class="pb ui" data-btn="btn-a" style="right:24px;bottom:86px">A</div>
+ <div class="pb ui" data-btn="btn-b" style="right:88px;bottom:24px">B</div>
+</div>
 <script>
 (function () {
   var CLICK_ON = __CLICK_ON__;
   var CLICK_SECRET = __CLICK_SECRET__;
+  var INPUT_ON = __INPUT_ON__;
   var hud = document.getElementById('hud');
   var canvas = document.getElementById('c');
   var ctx = canvas.getContext('2d');
-  var url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+  var wsBase = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+  var url = wsBase + '/ws';
   var frames = 0, last = new Date().getTime(), taps = 0, tapError = '';
+  var inState = 'keys off', lastInput = '';
+  var gpApi = !!(navigator.getGamepads || navigator.webkitGetGamepads);
   window.__frames = 0;
   window.__taps = 0;
   window.__mode = 'none';
@@ -96,6 +119,7 @@ VIEWER_HTML = b"""<!doctype html>
     var fps = frames * 1000 / Math.max(1, now - last);
     hud.textContent = window.__mode + ' ' + Math.round(fps) + ' fps' +
       (CLICK_ON ? ' \\u00b7 taps ' + taps : ' \\u00b7 view only') +
+      (INPUT_ON ? ' \\u00b7 ' + inState + ' ' + (lastInput || '-') + (gpApi ? ' gp' : '') : '') +
       (tapError ? ' \\u00b7 ' + tapError : '');
     if (now - last > 2000) { frames = 0; last = now; }
   }
@@ -248,7 +272,7 @@ VIEWER_HTML = b"""<!doctype html>
     var onTap = function (ev) {
       var target = ev.target;
       while (target) {
-        if (target === document.getElementById('fs')) { return; }
+        if (/(^| )ui( |$)/.test(target.className || '')) { return; }  // buttons, pad
         target = target.parentNode;
       }
       var now = new Date().getTime();
@@ -263,19 +287,188 @@ VIEWER_HTML = b"""<!doctype html>
       document.body.addEventListener('click', onTap, false);
     }
   }
+
+  // ---- Joy-Con / keyboard / touch-pad input -> Mac keys (--keys) ----
+  // Every source reduces to a name ('up', 'btn-a', 'w', 'k113'...); the server
+  // maps names to Mac keys and ignores anything outside its keymap. A name is
+  // down while any source holds it, and held names are re-sent every 500 ms so
+  // the server can release keys whose key-up was lost.
+  if (INPUT_ON) {
+    var held = {}, inWs = null, inReady = false;
+    var anyHeld = function (name) {
+      var h = held[name], s;
+      for (s in h) { if (h.hasOwnProperty(s)) { return true; } }
+      return false;
+    };
+    var press = function (src, name, down) {
+      var was = anyHeld(name);
+      if (down) { if (!held[name]) { held[name] = {}; } held[name][src] = true; }
+      else if (held[name]) { delete held[name][src]; }
+      var now = anyHeld(name);
+      if (now === was) { return; }
+      lastInput = src + ' ' + name + (now ? '+' : '-');
+      window.__lastInput = lastInput;
+      if (inReady) { inWs.send((now ? 'd:' : 'u:') + name); }
+    };
+    var releaseAll = function () {
+      var name, s;
+      for (name in held) { if (held.hasOwnProperty(name)) {
+        for (s in held[name]) { if (held[name].hasOwnProperty(s)) { press(s, name, false); } } } }
+    };
+    window.setInterval(function () {
+      var name;
+      if (!inReady) { return; }
+      for (name in held) { if (held.hasOwnProperty(name) && anyHeld(name)) { inWs.send('d:' + name); } }
+    }, 500);
+    var inputConnect = function () {
+      try { inWs = new WebSocket(wsBase + '/input'); } catch (e) { inState = 'keys: no ws'; return; }
+      inWs.onopen = function () { inWs.send('auth:' + CLICK_SECRET); };
+      inWs.onmessage = function (ev) {
+        var t = String(ev.data);
+        if (t === 'ok') { inReady = true; inState = 'keys'; return; }
+        if (t.indexOf('err:') === 0) { tapError = t.substring(4); }
+      };
+      inWs.onclose = function () {
+        inReady = false; inState = 'keys...';
+        window.setTimeout(inputConnect, 1000);
+      };
+    };
+    inputConnect();
+    window.addEventListener('blur', releaseAll, false);
+
+    // keyboard events: what the Joy-Cons (or a USB keyboard) deliver to the page
+    var KEYS = {8: 'backspace', 9: 'tab', 13: 'enter', 16: 'shift', 27: 'escape',
+                32: 'space', 37: 'left', 38: 'up', 39: 'right', 40: 'down'};
+    var keyName = function (ev) {
+      var c = ev.keyCode || ev.which || 0;
+      if (KEYS[c]) { return KEYS[c]; }
+      if ((c >= 65 && c <= 90) || (c >= 48 && c <= 57)) { return String.fromCharCode(c).toLowerCase(); }
+      return 'k' + c;
+    };
+    document.addEventListener('keydown', function (ev) {
+      press('key', keyName(ev), true); if (ev.preventDefault) { ev.preventDefault(); }
+    }, false);
+    document.addEventListener('keyup', function (ev) {
+      press('key', keyName(ev), false); if (ev.preventDefault) { ev.preventDefault(); }
+    }, false);
+
+    // Gamepad API, if this browser has it (standard mapping, Nintendo labels)
+    var BTN = ['btn-b', 'btn-a', 'btn-y', 'btn-x', 'btn-l', 'btn-r', 'btn-zl', 'btn-zr',
+               'btn-minus', 'btn-plus', 'btn-lstick', 'btn-rstick', 'up', 'down', 'left', 'right'];
+    var padHeld = {};
+    var padSet = function (src, name, on) {
+      if (on === !!padHeld[src + name]) { return; }
+      padHeld[src + name] = on;
+      press(src, name, on);
+    };
+    if (gpApi) {
+      window.setInterval(function () {
+        var pads = navigator.getGamepads ? navigator.getGamepads() : navigator.webkitGetGamepads();
+        var i, b, p, v, ax;
+        for (i = 0; pads && i < pads.length; i++) {
+          p = pads[i];
+          if (!p) { continue; }
+          for (b = 0; b < p.buttons.length; b++) {
+            v = p.buttons[b];
+            padSet('pad' + i, BTN[b] || ('pad-b' + b), typeof v === 'object' ? v.pressed : v > 0.5);
+          }
+          ax = p.axes || [];
+          padSet('stick' + i, 'left', ax[0] < -0.5); padSet('stick' + i, 'right', ax[0] > 0.5);
+          padSet('stick' + i, 'up', ax[1] < -0.5); padSet('stick' + i, 'down', ax[1] > 0.5);
+        }
+      }, 33);
+    }
+
+    // on-screen touch pad: stick (8-way) + A/B/X/Y
+    var pad = document.getElementById('pad'), padbtn = document.getElementById('padbtn');
+    var stick = document.getElementById('stick'), knob = document.getElementById('knob');
+    padbtn.style.display = 'block';
+    var togglePad = function (ev) {
+      ev.stopPropagation(); if (ev.preventDefault) { ev.preventDefault(); }
+      var show = pad.style.display !== 'block';
+      pad.style.display = show ? 'block' : 'none';
+      if (!show) { releaseAll(); }
+    };
+    padbtn.addEventListener('click', togglePad, false);
+    padbtn.addEventListener('touchend', togglePad, false);
+
+    var stickId = null, stickX = 0, stickY = 0;
+    var stickMove = function (x, y) {
+      var dx = x - stickX, dy = y - stickY, dz = 18;
+      padSet('touch', 'up', dy < -dz); padSet('touch', 'down', dy > dz);
+      padSet('touch', 'left', dx < -dz); padSet('touch', 'right', dx > dz);
+      var dist = Math.sqrt(dx * dx + dy * dy), m = dist > 50 ? 50 / dist : 1;
+      knob.style.left = Math.round(50 + dx * m) + 'px';
+      knob.style.top = Math.round(50 + dy * m) + 'px';
+    };
+    var stickStart = function (x, y, id) {
+      var r = stick.getBoundingClientRect();
+      stickId = id; stickX = r.left + r.width / 2; stickY = r.top + r.height / 2;
+      stickMove(x, y);
+    };
+    var stickEnd = function () { stickId = null; stickMove(stickX, stickY); };
+    var findTouch = function (ev) {
+      var i, t = ev.changedTouches || [];
+      for (i = 0; i < t.length; i++) { if (t[i].identifier === stickId) { return t[i]; } }
+      return null;
+    };
+    stick.addEventListener('touchstart', function (ev) {
+      var t = ev.changedTouches[0];
+      stickStart(t.clientX, t.clientY, t.identifier);
+      ev.preventDefault(); ev.stopPropagation();
+    }, false);
+    document.addEventListener('touchmove', function (ev) {
+      var t = stickId !== null && findTouch(ev);
+      if (t) { stickMove(t.clientX, t.clientY); }
+      if (ev.preventDefault) { ev.preventDefault(); }
+    }, false);
+    var stickTouchEnd = function (ev) { if (stickId !== null && findTouch(ev)) { stickEnd(); } };
+    document.addEventListener('touchend', stickTouchEnd, false);
+    document.addEventListener('touchcancel', stickTouchEnd, false);
+    stick.addEventListener('mousedown', function (ev) {
+      stickStart(ev.clientX, ev.clientY, 'mouse'); ev.preventDefault(); ev.stopPropagation();
+    }, false);
+    document.addEventListener('mousemove', function (ev) {
+      if (stickId === 'mouse') { stickMove(ev.clientX, ev.clientY); }
+    }, false);
+    document.addEventListener('mouseup', function () { if (stickId === 'mouse') { stickEnd(); } }, false);
+
+    var bindBtn = function (el) {
+      var name = el.getAttribute('data-btn');
+      var on = function (ev) {
+        padSet('touch', name, true); el.className = 'pb ui on';
+        ev.preventDefault(); ev.stopPropagation();
+      };
+      var off = function (ev) {
+        padSet('touch', name, false); el.className = 'pb ui';
+        ev.preventDefault(); ev.stopPropagation();
+      };
+      el.addEventListener('touchstart', on, false);
+      el.addEventListener('touchend', off, false);
+      el.addEventListener('touchcancel', off, false);
+      el.addEventListener('mousedown', on, false);
+      el.addEventListener('mouseup', off, false);
+      el.addEventListener('mouseleave', off, false);
+    };
+    var pbs = pad.getElementsByTagName('div'), pi;
+    for (pi = 0; pi < pbs.length; pi++) {
+      if (pbs[pi].getAttribute('data-btn')) { bindBtn(pbs[pi]); }
+    }
+  }
 })();
 </script>
 </body></html>
 """
 
 
-def render_viewer(click_enabled: bool, secret: str) -> bytes:
-    """Inject the click flag/secret into the static page (JS literals, JSON-escaped)."""
-    literal = json.dumps(secret if click_enabled else "")
+def render_viewer(click_enabled: bool, secret: str, input_enabled: bool = False) -> bytes:
+    """Inject the click/input flags and secret into the static page (JS literals, JSON-escaped)."""
+    literal = json.dumps(secret if click_enabled or input_enabled else "")
     literal = (literal.replace("<", "\\u003c").replace(">", "\\u003e")
                .replace("&", "\\u0026"))
     return (VIEWER_HTML
             .replace(b"__CLICK_ON__", b"true" if click_enabled else b"false")
+            .replace(b"__INPUT_ON__", b"true" if input_enabled else b"false")
             .replace(b"__CLICK_SECRET__", literal.encode()))
 
 
@@ -333,6 +526,8 @@ def _coregraphics():
     cg.CGDisplayBounds.restype = CGRect
     cg.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, CGPoint, ctypes.c_uint32]
     cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+    cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
+    cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
     cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
     cg.CGEventPost.restype = None
     cf.CFRelease.argtypes = [ctypes.c_void_p]
@@ -419,6 +614,161 @@ def quartz_click(px: int, py: int) -> None:
             raise OSError("CGEventCreateMouseEvent failed")
         q.cg.CGEventPost(0, event)  # kCGHIDEventTap
         q.cf.CFRelease(event)
+
+
+# macOS virtual keycodes (Carbon kVK_*) for the keys a keymap may target.
+# Command and Caps Lock are left out on purpose: a stray Cmd+Q is not a game input.
+MAC_KEYCODES = {
+    "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
+    "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17, "o": 31, "u": 32,
+    "i": 34, "p": 35, "l": 37, "j": 38, "k": 40, "n": 45, "m": 46,
+    "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25, "0": 29,
+    "minus": 27, "equal": 24, "bracketleft": 33, "bracketright": 30, "semicolon": 41,
+    "quote": 39, "comma": 43, "period": 47, "slash": 44, "backslash": 42, "grave": 50,
+    "return": 36, "tab": 48, "space": 49, "delete": 51, "escape": 53,
+    "shift": 56, "ctrl": 59, "option": 58,
+    "left": 123, "right": 124, "down": 125, "up": 126,
+}
+
+# Viewer input names -> Mac keys. Directions come from the stick, D-pad, arrow
+# keys or the touch pad; btn-* are Joy-Con/touch buttons; plain letters and
+# digits come from a USB keyboard on the Switch. Override with --keymap.
+DEFAULT_KEYMAP = {
+    "up": "w", "left": "a", "down": "s", "right": "d",
+    "btn-a": "space", "btn-b": "e", "btn-x": "f", "btn-y": "r",
+    "btn-l": "q", "btn-r": "tab", "btn-zl": "shift", "btn-zr": "ctrl",
+    "btn-plus": "escape", "btn-minus": "m",
+    "enter": "return", "space": "space", "escape": "escape", "tab": "tab",
+    "backspace": "delete", "shift": "shift",
+    **{c: c for c in "abcdefghijklmnopqrstuvwxyz0123456789"},
+}
+
+
+def parse_keymap(specs: list[str]) -> dict[str, str]:
+    """Merge 'name=key[,name=key]' specs over DEFAULT_KEYMAP; key 'none' unmaps."""
+    keymap = dict(DEFAULT_KEYMAP)
+    for spec in specs:
+        for item in filter(None, (p.strip() for p in spec.split(","))):
+            name, sep, key = item.partition("=")
+            name, key = name.strip().lower(), key.strip().lower()
+            if not sep or not name:
+                raise SystemExit(f"--keymap: expected name=key, got {item!r}")
+            if key == "none":
+                keymap.pop(name, None)
+            elif key in MAC_KEYCODES:
+                keymap[name] = key
+            else:
+                raise SystemExit(f"--keymap: unknown Mac key {key!r} "
+                                 f"(known: {', '.join(sorted(MAC_KEYCODES))})")
+    return keymap
+
+
+def quartz_key(code: int, down: bool) -> None:
+    """Post one key down/up via CGEvent (needs Accessibility, like clicks)."""
+    q = _coregraphics()
+    if q is None:
+        raise OSError("CoreGraphics unavailable")
+    event = q.cg.CGEventCreateKeyboardEvent(None, code, down)
+    if not event:
+        raise OSError("CGEventCreateKeyboardEvent failed")
+    q.cg.CGEventPost(0, event)  # kCGHIDEventTap
+    q.cf.CFRelease(event)
+
+
+class KeyInjector:
+    """Joy-Con/touch input -> held Mac keys, restricted to a keymap.
+
+    The viewer re-sends "down" for every held input twice a second; an input
+    not refreshed within hold_s is released. A dropped Wi-Fi link or a closed
+    applet therefore cannot leave W held down on the Mac.
+    """
+
+    def __init__(self, keymap: dict[str, str], dry_run: bool, hold_s: float = 1.5,
+                 poster=None):
+        self.keymap = keymap
+        self.dry_run = dry_run
+        self.hold_s = hold_s
+        self.poster = poster or quartz_key
+        self.stats = {"received": 0, "pressed": 0, "released": 0, "unmapped": 0,
+                      "expired": 0, "failed": 0}
+        self.seen: dict[str, int] = {}
+        self.connections = 0
+        self._holders: dict[str, dict[tuple, float]] = {}  # mac key -> {(conn, name): t}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        threading.Thread(target=self._expire_loop, daemon=True).start()
+
+    def _post(self, key: str, down: bool) -> None:
+        self.stats["pressed" if down else "released"] += 1
+        if self.dry_run:
+            return
+        try:
+            self.poster(MAC_KEYCODES[key], down)
+        except OSError:
+            self.stats["failed"] += 1
+
+    def press(self, conn, name: str, down: bool) -> str | None:
+        """Apply one input event; returns an error for the viewer, or None."""
+        name = name[:32].lower()
+        with self._lock:
+            self.stats["received"] += 1
+            if name in self.seen or len(self.seen) < 64:  # bounded probe record
+                self.seen[name] = self.seen.get(name, 0) + 1
+            key = self.keymap.get(name)
+            if key is None:
+                self.stats["unmapped"] += 1
+                if self.seen.get(name) == 1:
+                    print(f"[keys] unmapped input '{name}' "
+                          f"(map it with --keymap {name}=KEY)", flush=True)
+                return None
+            if down and not self.dry_run and accessibility_trusted() is False:
+                self.stats["failed"] += 1
+                return "Accessibility permission missing"
+            holders = self._holders.setdefault(key, {})
+            if down:
+                if not holders:
+                    self._post(key, True)
+                holders[(conn, name)] = time.monotonic()
+            elif holders.pop((conn, name), None) is not None and not holders:
+                del self._holders[key]
+                self._post(key, False)
+        return None
+
+    def release_all(self, conn) -> None:
+        with self._lock:
+            for key in list(self._holders):
+                holders = self._holders[key]
+                for owner in [o for o in holders if o[0] is conn]:
+                    del holders[owner]
+                if not holders:
+                    del self._holders[key]
+                    self._post(key, False)
+
+    def _expire_loop(self) -> None:
+        while not self._stop.wait(0.25):
+            now = time.monotonic()
+            with self._lock:
+                for key in list(self._holders):
+                    holders = self._holders[key]
+                    for owner in [o for o, t in holders.items() if now - t > self.hold_s]:
+                        del holders[owner]
+                        self.stats["expired"] += 1
+                    if not holders:
+                        del self._holders[key]
+                        self._post(key, False)
+
+    def close(self) -> None:
+        """Release everything (server shutdown) and stop the expiry thread."""
+        self._stop.set()
+        with self._lock:
+            for key in list(self._holders):
+                del self._holders[key]
+                self._post(key, False)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {"connections": self.connections, "held": sorted(self._holders),
+                    "stats": dict(self.stats), "seen": dict(self.seen)}
 
 
 class Clicker:
@@ -820,7 +1170,8 @@ class WSClientParser:
 
 def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                  allowed_hosts: set[str] | None = None,
-                 click_allow: set[str] | None = None):
+                 click_allow: set[str] | None = None,
+                 injector: "KeyInjector | None" = None):
     from http.server import BaseHTTPRequestHandler
 
     class Handler(BaseHTTPRequestHandler):
@@ -899,8 +1250,9 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 return
             path = self.path.split("?")[0]
             if path == "/":
-                page = render_viewer(clicker is not None and self._click_client_ok(),
-                                     clicker.secret if clicker else "")
+                allowed = clicker is not None and self._click_client_ok()
+                page = render_viewer(allowed, clicker.secret if clicker else "",
+                                     allowed and injector is not None)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(page)))
@@ -920,6 +1272,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                     "clicks_enabled": clicker is not None,
                     "last_click": clicker.last_click if clicker else None,
                     "accessibility": accessibility_trusted() if clicker else None,
+                    "input": injector.snapshot() if injector else None,
                 }).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1013,8 +1366,66 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 finally:
                     hub.remove_client(client)
                 self.close_connection = True
+            elif path == "/input":
+                self._input()
             else:
                 self.send_error(404)
+
+        def _input(self) -> None:
+            """Joy-Con/touch input socket: 'auth:<secret>', then 'd:<name>' / 'u:<name>'."""
+            if injector is None or clicker is None:
+                self.send_error(403, "input is disabled (start with --keys)")
+                return
+            if not self._click_client_ok():
+                self.send_error(403, "input not allowed from this client")
+                return
+            if not ws_upgrade(self):
+                return
+            self.close_connection = True
+            ip = self.client_address[0]
+            conn = object()
+            parser = WSClientParser()
+            authed = False
+            budget, refill = 60.0, time.monotonic()  # ~60 events/s per socket
+            with injector._lock:
+                injector.connections += 1
+            try:
+                while True:
+                    data = self.connection.recv(4096)
+                    if not data:
+                        return
+                    for kind, payload in parser.feed(data):
+                        if kind == "close":
+                            ws_send_frame(self.connection, payload[:125], 0x8)
+                            return
+                        if kind == "ping":
+                            ws_send_frame(self.connection, payload[:125], 0xA)
+                            continue
+                        text = payload.decode("utf-8", "ignore")
+                        if not authed:
+                            if text.startswith("auth:") and clicker.check_secret(text[5:]):
+                                authed = True
+                                ws_send_frame(self.connection, b"ok", 0x1)
+                                continue
+                            clicker.reject(ip)
+                            ws_send_frame(self.connection, b"err:bad secret", 0x1)
+                            return
+                        now = time.monotonic()
+                        budget = min(60.0, budget + (now - refill) * 60.0)
+                        refill = now
+                        if budget < 1:
+                            continue  # over budget: drop; held keys still expire
+                        budget -= 1
+                        if text[:2] in ("d:", "u:"):
+                            err = injector.press(conn, text[2:], text[0] == "d")
+                            if err:
+                                ws_send_frame(self.connection, b"err:" + err.encode(), 0x1)
+            except (OSError, ValueError):
+                pass
+            finally:
+                injector.release_all(conn)
+                with injector._lock:
+                    injector.connections -= 1
 
     return Handler
 
@@ -1244,6 +1655,13 @@ def main() -> int:
                          "negative needs the = form: --click-display-origin=-1920,0)")
     ap.add_argument("--click-dry-run", action="store_true",
                      help="log the synthesizer command instead of clicking (safe test)")
+    ap.add_argument("--keys", action="store_true",
+                    help="forward Joy-Con/touch-pad input as Mac key presses "
+                         "(needs --click-secret; only keys in the keymap can be pressed)")
+    ap.add_argument("--keymap", action="append", default=[], metavar="NAME=KEY,...",
+                    help="remap inputs, e.g. 'btn-a=e,up=up'; KEY 'none' unmaps "
+                         "(default: stick/D-pad -> WASD, A space, B e, X f, Y r, "
+                         "L q, R tab, ZL shift, ZR ctrl, + escape, - m)")
     ap.add_argument("--allow-host", action="append", default=[],
                     help="additional HTTP Host name allowed (repeatable)")
     ap.add_argument("--click-allow", action="append", default=[], metavar="IP",
@@ -1296,6 +1714,11 @@ def main() -> int:
             origin=origin or (0, 0),
             dry_run=args.click_dry_run,
         )
+    injector = None
+    if args.keys:
+        if not clicker:
+            raise SystemExit("--keys needs --click-secret (or SWITCHDISPLAY_SECRET)")
+        injector = KeyInjector(parse_keymap(args.keymap), dry_run=args.click_dry_run)
     lan_ip = _lan_ip()
     if clicker and args.bind == "0.0.0.0":
         args.bind = lan_ip
@@ -1310,7 +1733,8 @@ def main() -> int:
         dns_sock.bind((dns_bind, args.dns_port))
     hub = Hub(cmd)
     server = LocalThreadingHTTPServer((args.bind, args.port),
-                                 make_handler(hub, clicker, allowed_hosts, set(args.click_allow)))
+                                 make_handler(hub, clicker, allowed_hosts, set(args.click_allow),
+                                              injector))
     server.daemon_threads = True
     if os.geteuid() == 0 and os.environ.get("SUDO_UID"):
         uid, gid = int(os.environ["SUDO_UID"]), int(os.environ.get("SUDO_GID", "0"))
@@ -1341,6 +1765,12 @@ def main() -> int:
                   "macOS has been asked to show its permission prompt.", flush=True)
     else:
         print("[click] tap-to-click OFF (no --click-secret / SWITCHDISPLAY_SECRET)", flush=True)
+    if injector:
+        shown = ("up", "left", "down", "right", "btn-a", "btn-b", "btn-x", "btn-y",
+                 "btn-l", "btn-r", "btn-zl", "btn-zr", "btn-plus", "btn-minus", "enter")
+        print(f"[keys] Joy-Con/touch input ON{' (DRY RUN)' if args.click_dry_run else ''}: " +
+              " ".join(f"{n}={injector.keymap[n]}" for n in shown if n in injector.keymap),
+              flush=True)
     def _terminate(signum, frame):
         raise KeyboardInterrupt  # run the finally below: ffmpeg is in its own session
     signal.signal(signal.SIGTERM, _terminate)
@@ -1350,6 +1780,8 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        if injector:
+            injector.close()
         hub.stop()
     return 0
 
