@@ -156,6 +156,179 @@ class Tests(unittest.TestCase):
         with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=False):
             self.assertEqual(dry.click("a", 1, 1, (2, 2))[0], 200)
 
+    def test_keymap_parsing(self):
+        km = switchdisplay.parse_keymap(["btn-a=e, up=up", "btn-minus=none"])
+        self.assertEqual((km["btn-a"], km["up"], km["left"]), ("e", "up", "a"))
+        self.assertNotIn("btn-minus", km)
+        with self.assertRaises(SystemExit):
+            switchdisplay.parse_keymap(["btn-a=command"])  # Cmd is deliberately not mappable
+        with self.assertRaises(SystemExit):
+            switchdisplay.parse_keymap(["btn-a"])
+
+    def test_key_injector_holds_maps_and_expires(self):
+        posted = []
+        inj = switchdisplay.KeyInjector(dict(switchdisplay.DEFAULT_KEYMAP), dry_run=False,
+                                        hold_s=0.3, poster=lambda code, down: posted.append((code, down)))
+        W = switchdisplay.MAC_KEYCODES["w"]
+        try:
+            with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=True):
+                one, two = object(), object()
+                inj.press(one, "up", True)
+                inj.press(two, "w", True)        # second holder of the same Mac key
+                inj.press(one, "up", False)
+                self.assertEqual(posted, [(W, True)])  # still held by the other
+                inj.press(two, "w", False)
+                self.assertEqual(posted, [(W, True), (W, False)])
+                self.assertIsNone(inj.press(one, "k999", True))  # unmapped: ignored
+                self.assertEqual(inj.snapshot()["seen"]["k999"], 1)
+                inj.press(one, "btn-a", True)    # key-up never arrives
+                time.sleep(0.7)
+                space = switchdisplay.MAC_KEYCODES["space"]
+                self.assertEqual(posted[-2:], [(space, True), (space, False)])
+                self.assertEqual(inj.stats["expired"], 1)
+                inj.press(one, "left", True)
+                inj.release_all(one)             # socket closed
+                self.assertEqual(posted[-1], (switchdisplay.MAC_KEYCODES["a"], False))
+            with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=False):
+                self.assertIn("Accessibility", inj.press(one, "up", True))
+        finally:
+            inj.close()
+
+    def test_mouse_buttons_hold_expire_and_turn_motion_into_drags(self):
+        buttons, moves = [], []
+        inj = switchdisplay.KeyInjector(
+            switchdisplay.parse_keymap(["btn-zl=mouse-right"]), dry_run=False, hold_s=0.3,
+            button_poster=lambda b, down: buttons.append((b, down)),
+            mover=lambda *a: moves.append(a), bounds=(0, 0, 100, 100))
+        try:
+            with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=True):
+                conn = object()
+                inj.move(5, -3)
+                self.assertEqual(moves[-1], (5, -3, (0, 0, 100, 100), 5, 0))
+                inj.press(conn, "btn-zr", True)
+                inj.press(conn, "btn-rstick", True)  # both map to the left button
+                self.assertEqual(buttons, [(0, True)])
+                inj.move(1, 1)
+                self.assertEqual(moves[-1][3:], (6, 0))
+                inj.press(conn, "btn-zr", False)
+                inj.press(conn, "btn-rstick", False)
+                self.assertEqual(buttons[-1], (0, False))
+                inj.press(conn, "btn-zl", True)
+                inj.move(1, 1)
+                self.assertEqual(moves[-1][3:], (7, 1))
+                time.sleep(0.7)                       # release never arrives
+                self.assertEqual(buttons[-1], (1, False))
+                inj.move(100000, -100000)             # a viewer can't fling it
+                self.assertEqual(moves[-1][:2], (400, -400))
+            with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=False):
+                count = len(moves)
+                self.assertIn("Accessibility", inj.move(1, 1))
+                self.assertEqual(len(moves), count)
+        finally:
+            inj.close()
+
+    def test_frontmost_pid_parses_both_lsappinfo_formats(self):
+        for output in ('"pid"=4242\n', '[ NULL ]\n    pid = 4242 !cgsConnection type=[ NULL ]\n'):
+            result = SimpleNamespace(stdout=output)
+            with unittest.mock.patch("subprocess.run", return_value=result):
+                self.assertEqual(switchdisplay._frontmost_pid(), 4242)
+        with unittest.mock.patch("subprocess.run", return_value=SimpleNamespace(stdout="nope")):
+            self.assertIsNone(switchdisplay._frontmost_pid())
+
+    def test_clean_text_removes_control_characters(self):
+        self.assertEqual(switchdisplay.clean_text("hi\r\n\tthere\x1b\u2028 \U0001F600"),
+                         "hithere \U0001F600")
+        self.assertEqual(len(switchdisplay.clean_text("x" * 5000)), switchdisplay.MAX_TEXT)
+
+    def test_text_needs_opt_in_and_accessibility(self):
+        typed = []
+        off = switchdisplay.KeyInjector({}, dry_run=False, text_poster=typed.append)
+        on = switchdisplay.KeyInjector({}, dry_run=False, text_poster=typed.append, text_enabled=True)
+        try:
+            with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=True):
+                off.type_text("no")
+                self.assertEqual(typed, [])
+                on.type_text("h\ri")
+                self.assertEqual(typed, ["hi"])
+            with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=False):
+                self.assertIn("Accessibility", on.type_text("x"))
+                self.assertEqual(typed, ["hi"])
+        finally:
+            off.close(); on.close()
+
+    def test_click_prompts_keyboard_only_for_text_fields(self):
+        checks = [True, False]
+        reader, writer = socket.socketpair()
+        inj = switchdisplay.KeyInjector(dict(switchdisplay.DEFAULT_KEYMAP), dry_run=True,
+                                        text_enabled=True, focus_check=lambda: checks.pop(0),
+                                        focus_delay_s=0.01)
+        inj.add_socket(writer)
+        try:
+            conn = object()
+            inj.press(conn, "btn-zr", True)
+            inj.press(conn, "btn-zr", False)        # text field focused: prompt
+            time.sleep(0.15)
+            self.assertEqual(reader.recv(16), b"\x81\x02kb")
+            inj.after_click()                        # something else focused: no prompt
+            time.sleep(0.15)
+            reader.setblocking(False)
+            with self.assertRaises(BlockingIOError):
+                reader.recv(16)
+            self.assertEqual(inj.stats["keyboard_prompts"], 1)
+        finally:
+            inj.close(); reader.close(); writer.close()
+
+    def test_input_socket_requires_secret_and_releases_on_close(self):
+        posted = []
+        moved = []
+        inj = switchdisplay.KeyInjector(dict(switchdisplay.DEFAULT_KEYMAP), dry_run=False,
+                                        poster=lambda code, down: posted.append((code, down)),
+                                        mover=lambda *a: moved.append(a[:2]))
+        clicker = switchdisplay.Clicker("sekrit", None, (0, 0), True)
+        hub = switchdisplay.Hub([])
+        server = ThreadingHTTPServer(("127.0.0.1", 0), switchdisplay.make_handler(
+            hub, clicker, {"127.0.0.1"}, set(), inj))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        def ws(texts):
+            sock = socket.create_connection(("127.0.0.1", server.server_port))
+            sock.sendall(b"GET /input HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+                         b"Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                         b"Sec-WebSocket-Version: 13\r\n\r\n")
+            self.assertIn(b"101", sock.recv(4096))
+            for t in texts:
+                t = t.encode(); mask = b"\x01\x02\x03\x04"
+                sock.sendall(bytes([0x81, 0x80 | len(t)]) + mask +
+                             bytes(c ^ mask[i % 4] for i, c in enumerate(t)))
+            time.sleep(0.2)
+            return sock
+        try:
+            with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=True):
+                bad = ws(["auth:wrong", "d:up", "m:7,-2"])
+                self.assertIn(b"err:bad secret", bad.recv(4096))
+                bad.close()
+                self.assertEqual((posted, moved), ([], []))
+                good = ws(["auth:sekrit", "d:up", "p:mousemove=3", "p:wheel=x", "m:7,-2", "m:bad"])
+                self.assertIn(b"ok", good.recv(4096))
+                self.assertEqual(moved, [(7, -2)])
+                self.assertEqual(inj.snapshot()["probe"], {"mousemove": 3})
+                self.assertEqual(posted, [(switchdisplay.MAC_KEYCODES["w"], True)])
+                good.close()                      # no key-up sent: closing must release
+                time.sleep(0.3)
+                self.assertEqual(posted[-1], (switchdisplay.MAC_KEYCODES["w"], False))
+        finally:
+            server.shutdown(); server.server_close(); inj.close()
+
+    def test_viewer_input_flag(self):
+        on = switchdisplay.render_viewer(True, "s", True).decode()
+        off = switchdisplay.render_viewer(True, "s").decode()
+        self.assertIn("var INPUT_ON = true;", on)
+        self.assertIn("var INPUT_ON = false;", off)
+        self.assertIn("padSeen && name === 'enter'", on)  # A must not also press Return
+        self.assertIn("var TEXT_ON = false;", on)
+        self.assertIn("var TEXT_ON = true;", switchdisplay.render_viewer(True, "s", True, True).decode())
+        self.assertIn("var TEXT_ON = false;", switchdisplay.render_viewer(False, "", False, True).decode())
+
     def test_mac_presets_capture_screens_by_name(self):
         args = SimpleNamespace(source=None, preset="mac-mirror", screen=None, display_index=None,
                                width=960, height=540, fps=15, quality=65, static=False)

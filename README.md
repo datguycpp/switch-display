@@ -118,7 +118,8 @@ The viewer supports `?mode=canvas` (default WebSocket canvas), `?mode=img`
 the selected mode and measured render fps for A/B comparisons on the Switch.
 
 Endpoints: `/` viewer page, `/ws` binary JPEG WebSocket, `/mjpeg` MJPEG
-fallback, `POST /click` (tap-to-click), `/health` counters.
+fallback, `POST /click` (tap-to-click), `/input` (Joy-Con/touch keys, with
+`--keys`), `/health` counters.
 
 **Tap-to-click** is opt-in and single-purpose: a tap on the Switch becomes one
 left click at that point on the Mac display. No drag, no hover, no right click,
@@ -136,6 +137,34 @@ directly (`quartz`, no install needed), with `osascript` as a last resort if
 CoreGraphics can't be loaded. All of them need **Accessibility** permission for the terminal
 (capture needs **Screen Recording**, which is a separate permission). Without a
 secret `/click` returns 403 and the page renders view-only.
+
+**Joy-Con / touch-pad control** (`--keys`, opt-in, needs the click secret) turns
+Switch input into held Mac keys and pointer motion, for example WASD movement in
+games with the right stick as the mouse:
+
+```bash
+--keys                                     # left stick/D-pad -> W A S D, right stick -> pointer,
+                                           # ZR or right-stick press -> left click (hold to drag),
+                                           # A space, B e, X f, Y r, L q, R tab, ZL shift,
+                                           # + escape, - m
+--keymap 'btn-a=e,btn-b=space'             # remap; 'name=none' unmaps; repeatable
+```
+
+The viewer forwards three sources over a separate `/input` WebSocket, so key
+presses never wait behind video frames: keyboard events the applet delivers
+(Joy-Con buttons it maps to keys, or a USB keyboard), the Gamepad API if the
+browser has it, and an on-screen stick plus A/B/X/Y pad (the **pad** button,
+for handheld mode). Only keys and mouse buttons in the keymap can be pressed,
+Command is not mappable, and the pointer stays on the captured screen. Held inputs are re-sent every 500 ms, and any key not refreshed for
+1.5 s, or whose socket closes, is released, so a dropped link can't leave W
+held down. Which Joy-Con buttons the Switch's browser passes to a page is not
+documented. The HUD and `/health` `input.seen`/`input.probe` show what arrives, and the
+server log names unmapped inputs (see MAC-SETUP.md, "Joy-Con controls").
+
+`--text` (with `--keys`) adds the Switch's on-screen keyboard: a text box opens on
+the Switch when a click focuses a text field in a normal Mac app, or when you press
+**−** or tap **kbd**, and what you enter is typed on the Mac. It allows any text and
+sends it over plain HTTP, so it's opt-in, and password fields don't open the box.
 
 ### Custom capture (`--source`)
 
