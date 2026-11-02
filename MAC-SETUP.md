@@ -200,8 +200,9 @@ curl -s http://<mac-lan-ip>:80/health | python3 -m json.tool
 
 ## Joy-Con controls (optional)
 
-Add `--keys` (it needs `--click-secret`) to turn Switch input into Mac key
-presses, for example WASD to walk around in a game:
+Add `--keys` (it needs `--click-secret`) to control the Mac from the Switch:
+the left stick walks with WASD, the right stick moves the Mac's pointer, and ZR
+clicks:
 
 ```bash
 sudo python3 switchdisplay.py --preset mac-mirror --screen 0 \
@@ -211,24 +212,39 @@ sudo python3 switchdisplay.py --preset mac-mirror --screen 0 \
 
 | Switch input | Name | Default Mac key |
 |---|---|---|
-| Stick / D-pad / touch stick up, left, down, right | `up` `left` `down` `right` | W A S D |
+| Left stick / D-pad / touch stick up, left, down, right | `up` `left` `down` `right` | W A S D |
+| Right stick | (not remappable) | moves the Mac's pointer |
+| ZR, right-stick press | `btn-zr` `btn-rstick` | left mouse button (hold to drag) |
 | A, B, X, Y | `btn-a` `btn-b` `btn-x` `btn-y` | Space, E, F, R |
-| L, R, ZL, ZR | `btn-l` `btn-r` `btn-zl` `btn-zr` | Q, Tab, Shift, Ctrl |
+| L, R, ZL | `btn-l` `btn-r` `btn-zl` | Q, Tab, Shift |
 | +, − | `btn-plus` `btn-minus` | Escape, M |
-| Enter (what the applet may send for A) | `enter` | Return |
+| Enter (USB keyboard, when no gamepad is connected) | `enter` | Return |
 | USB keyboard letters/digits | `w`, `7`, … | the same key |
 | Any other key code | `k<code>`, e.g. `k113` | not mapped |
 
 Remap with `--keymap 'btn-a=e,enter=space'` (repeatable; `name=none` unmaps).
 Mac key names: letters, digits, `space return tab escape delete shift ctrl
 option up down left right minus equal comma period slash semicolon quote
-bracketleft bracketright backslash grave`. Command can't be mapped, so a stray
+bracketleft bracketright backslash grave`, plus `mouse-left` and `mouse-right`
+(for example `--keymap btn-zl=mouse-right`). Command can't be mapped, so a stray
 press can never send Cmd+Q.
+
+The pointer stays on the screen being shown on the Switch, and a small tilt moves
+it slowly for aiming. Moves also carry relative motion, which games that capture
+the mouse for camera control read, but that hasn't been tried in a game. Two
+quick clicks don't count as a macOS double-click yet.
+
+The left stick also moves a blue ring on the Switch. The Switch's browser draws
+that ring itself, and CSS on the page doesn't hide it. It doesn't touch the Mac.
+**To stop the ring moving, press the left stick in** (the footer's **Cursor**
+hint). WASD and the right stick keep working in that mode. The browser also turns
+A into Enter there, so while a gamepad is connected the page ignores that Enter.
+This includes the Enter key on a USB keyboard.
 
 **Two ways to send input**
 
-* **Joy-Cons:** press buttons while the viewer is open. What the Switch's
-  browser passes to the page isn't documented, so check what arrives (below).
+* **Joy-Cons:** use them while the viewer is open. The browser reports them as a
+  gamepad. Button layouts aren't documented, so check what arrives (below).
 * **Touch pad (handheld):** tap **pad** at the top right. A stick appears
   bottom-left and A/B/X/Y bottom-right; they work with several fingers at once
   and never send taps. Tap **pad** again to hide it (that releases everything).
@@ -241,7 +257,9 @@ viewer open, then check any of these:
   `pad0 btn-a+`.
 * the server log: `[keys] unmapped input 'k113' (map it with --keymap k113=KEY)`
 * `curl -s http://<mac-lan-ip>:80/health`, whose `"input": {"seen": {...}}`
-  counts every name received
+  counts every name received, `"probe"` counts every event type the page received
+  (including `gamepad-axes` and `right-stick`), and `"stats"."moves"` counts
+  pointer moves
 
 Then map what you found, for example `--keymap k113=space`. A button the
 browser keeps for itself (Home always, possibly B for "back") never reaches
@@ -256,8 +274,7 @@ so.
 
 **Games:** this suits games that read the keyboard normally (most browser,
 indie and many Steam games). Some games read raw HID devices and ignore
-synthesized keys. There's no mouse-look: camera control in 3D games still
-needs the mouse or keys mapped to turning.
+synthesized input.
 
 ---
 
@@ -302,7 +319,7 @@ good and the problem is the Switch's DNS/applet step.
   no built-in user-creatable virtual display).
 * **One session at a time**; the applet is modal and ends when you leave it.
 * **Tap = one left click.** No drag, no hover, no right click. Keys only with
-  `--keys`, and then only the keys in the keymap. For full input (mouse-look,
-  analog sticks) and low latency use Sunshine (Mac) + Moonlight-NX (Switch,
+  `--keys`, and then only the keys in the keymap plus right-stick pointer motion.
+  For analog movement and low latency use Sunshine (Mac) + Moonlight-NX (Switch,
   requires homebrew).
 * Everything stays on the LAN; nothing is sent off-machine.

@@ -194,10 +194,45 @@ class Tests(unittest.TestCase):
         finally:
             inj.close()
 
+    def test_mouse_buttons_hold_expire_and_turn_motion_into_drags(self):
+        buttons, moves = [], []
+        inj = switchdisplay.KeyInjector(
+            switchdisplay.parse_keymap(["btn-zl=mouse-right"]), dry_run=False, hold_s=0.3,
+            button_poster=lambda b, down: buttons.append((b, down)),
+            mover=lambda *a: moves.append(a), bounds=(0, 0, 100, 100))
+        try:
+            with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=True):
+                conn = object()
+                inj.move(5, -3)
+                self.assertEqual(moves[-1], (5, -3, (0, 0, 100, 100), 5, 0))
+                inj.press(conn, "btn-zr", True)
+                inj.press(conn, "btn-rstick", True)  # both map to the left button
+                self.assertEqual(buttons, [(0, True)])
+                inj.move(1, 1)
+                self.assertEqual(moves[-1][3:], (6, 0))
+                inj.press(conn, "btn-zr", False)
+                inj.press(conn, "btn-rstick", False)
+                self.assertEqual(buttons[-1], (0, False))
+                inj.press(conn, "btn-zl", True)
+                inj.move(1, 1)
+                self.assertEqual(moves[-1][3:], (7, 1))
+                time.sleep(0.7)                       # release never arrives
+                self.assertEqual(buttons[-1], (1, False))
+                inj.move(100000, -100000)             # a viewer can't fling it
+                self.assertEqual(moves[-1][:2], (400, -400))
+            with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=False):
+                count = len(moves)
+                self.assertIn("Accessibility", inj.move(1, 1))
+                self.assertEqual(len(moves), count)
+        finally:
+            inj.close()
+
     def test_input_socket_requires_secret_and_releases_on_close(self):
         posted = []
+        moved = []
         inj = switchdisplay.KeyInjector(dict(switchdisplay.DEFAULT_KEYMAP), dry_run=False,
-                                        poster=lambda code, down: posted.append((code, down)))
+                                        poster=lambda code, down: posted.append((code, down)),
+                                        mover=lambda *a: moved.append(a[:2]))
         clicker = switchdisplay.Clicker("sekrit", None, (0, 0), True)
         hub = switchdisplay.Hub([])
         server = ThreadingHTTPServer(("127.0.0.1", 0), switchdisplay.make_handler(
@@ -218,12 +253,14 @@ class Tests(unittest.TestCase):
             return sock
         try:
             with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=True):
-                bad = ws(["auth:wrong", "d:up"])
+                bad = ws(["auth:wrong", "d:up", "m:7,-2"])
                 self.assertIn(b"err:bad secret", bad.recv(4096))
                 bad.close()
-                self.assertEqual(posted, [])
-                good = ws(["auth:sekrit", "d:up"])
+                self.assertEqual((posted, moved), ([], []))
+                good = ws(["auth:sekrit", "d:up", "p:mousemove=3", "p:wheel=x", "m:7,-2", "m:bad"])
                 self.assertIn(b"ok", good.recv(4096))
+                self.assertEqual(moved, [(7, -2)])
+                self.assertEqual(inj.snapshot()["probe"], {"mousemove": 3})
                 self.assertEqual(posted, [(switchdisplay.MAC_KEYCODES["w"], True)])
                 good.close()                      # no key-up sent: closing must release
                 time.sleep(0.3)
@@ -236,6 +273,7 @@ class Tests(unittest.TestCase):
         off = switchdisplay.render_viewer(True, "s").decode()
         self.assertIn("var INPUT_ON = true;", on)
         self.assertIn("var INPUT_ON = false;", off)
+        self.assertIn("padSeen && name === 'enter'", on)  # A must not also press Return
 
     def test_mac_presets_capture_screens_by_name(self):
         args = SimpleNamespace(source=None, preset="mac-mirror", screen=None, display_index=None,

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import hashlib
 import hmac
 import json
@@ -314,11 +315,29 @@ VIEWER_HTML = b"""<!doctype html>
       var name, s;
       for (name in held) { if (held.hasOwnProperty(name)) {
         for (s in held[name]) { if (held[name].hasOwnProperty(s)) { press(s, name, false); } } } }
+      padHeld = {};  // or the next press of a released input would be ignored
     };
+    // probe: which events does the browser deliver at all? Joy-Cons may drive
+    // its own pointer or scrolling instead of sending keys.
+    var probe = {}, probeSent = {};
+    var probeCount = function (ev) { probe[ev.type] = (probe[ev.type] || 0) + 1; };
+    var PROBED = ['keydown', 'keyup', 'keypress', 'mousemove', 'mousedown', 'mouseup', 'click',
+                  'contextmenu', 'wheel', 'mousewheel', 'scroll', 'touchstart', 'touchend',
+                  'focus', 'blur', 'gamepadconnected', 'gamepaddisconnected'], pn;
+    for (pn = 0; pn < PROBED.length; pn++) { window.addEventListener(PROBED[pn], probeCount, true); }
     window.setInterval(function () {
-      var name;
+      var name, pads, i, n = 0;
       if (!inReady) { return; }
       for (name in held) { if (held.hasOwnProperty(name) && anyHeld(name)) { inWs.send('d:' + name); } }
+      if (gpApi) {
+        pads = navigator.getGamepads ? navigator.getGamepads() : navigator.webkitGetGamepads();
+        for (i = 0; pads && i < pads.length; i++) { if (pads[i]) { n++; } }
+        probe['gamepads-connected'] = n;
+      } else { probe['no-gamepad-api'] = 1; }
+      for (name in probe) { if (probe.hasOwnProperty(name) && probe[name] !== probeSent[name]) {
+        probeSent[name] = probe[name];
+        inWs.send('p:' + name + '=' + probe[name]);
+      } }
     }, 500);
     var inputConnect = function () {
       try { inWs = new WebSocket(wsBase + '/input'); } catch (e) { inState = 'keys: no ws'; return; }
@@ -345,17 +364,39 @@ VIEWER_HTML = b"""<!doctype html>
       if ((c >= 65 && c <= 90) || (c >= 48 && c <= 57)) { return String.fromCharCode(c).toLowerCase(); }
       return 'k' + c;
     };
-    document.addEventListener('keydown', function (ev) {
-      press('key', keyName(ev), true); if (ev.preventDefault) { ev.preventDefault(); }
-    }, false);
-    document.addEventListener('keyup', function (ev) {
-      press('key', keyName(ev), false); if (ev.preventDefault) { ev.preventDefault(); }
-    }, false);
+    var padSeen = false;
+    var keyEvent = function (ev, down) {
+      var name = keyName(ev);
+      // In its select mode the applet also turns A into Enter; the gamepad
+      // already reports A, so forwarding both would press two Mac keys.
+      if (!(padSeen && name === 'enter')) { press('key', name, down); }
+      if (ev.preventDefault) { ev.preventDefault(); }
+    };
+    document.addEventListener('keydown', function (ev) { keyEvent(ev, true); }, false);
+    document.addEventListener('keyup', function (ev) { keyEvent(ev, false); }, false);
 
     // Gamepad API, if this browser has it (standard mapping, Nintendo labels)
     var BTN = ['btn-b', 'btn-a', 'btn-y', 'btn-x', 'btn-l', 'btn-r', 'btn-zl', 'btn-zr',
                'btn-minus', 'btn-plus', 'btn-lstick', 'btn-rstick', 'up', 'down', 'left', 'right'];
     var padHeld = {};
+    var STICK_DEAD = 0.15, STICK_SPEED = 900;  // full tilt: points per second on the Mac
+    var moveX = 0, moveY = 0, lastPoll = new Date().getTime();
+    var pointerStick = function (rx, ry) {
+      var now = new Date().getTime(), dt = Math.min(now - lastPoll, 100) / 1000, mag, dx, dy;
+      lastPoll = now;
+      if (typeof rx !== 'number' || typeof ry !== 'number') { return; }
+      mag = Math.sqrt(rx * rx + ry * ry);
+      if (mag < STICK_DEAD) { moveX = 0; moveY = 0; return; }
+      probe['right-stick'] = (probe['right-stick'] || 0) + 1;
+      // squared response: small tilts aim precisely, full tilt crosses the screen.
+      // Fractions carry over so a slow tilt still moves.
+      moveX += rx * mag * STICK_SPEED * dt;
+      moveY += ry * mag * STICK_SPEED * dt;
+      dx = moveX < 0 ? Math.ceil(moveX) : Math.floor(moveX);
+      dy = moveY < 0 ? Math.ceil(moveY) : Math.floor(moveY);
+      moveX -= dx; moveY -= dy;
+      if ((dx || dy) && inReady) { inWs.send('m:' + dx + ',' + dy); }
+    };
     var padSet = function (src, name, on) {
       if (on === !!padHeld[src + name]) { return; }
       padHeld[src + name] = on;
@@ -368,6 +409,9 @@ VIEWER_HTML = b"""<!doctype html>
         for (i = 0; pads && i < pads.length; i++) {
           p = pads[i];
           if (!p) { continue; }
+          padSeen = true;
+          probe['gamepad-buttons'] = p.buttons.length;
+          probe['gamepad-axes'] = (p.axes || []).length;
           for (b = 0; b < p.buttons.length; b++) {
             v = p.buttons[b];
             padSet('pad' + i, BTN[b] || ('pad-b' + b), typeof v === 'object' ? v.pressed : v > 0.5);
@@ -375,6 +419,7 @@ VIEWER_HTML = b"""<!doctype html>
           ax = p.axes || [];
           padSet('stick' + i, 'left', ax[0] < -0.5); padSet('stick' + i, 'right', ax[0] > 0.5);
           padSet('stick' + i, 'up', ax[1] < -0.5); padSet('stick' + i, 'down', ax[1] > 0.5);
+          pointerStick(ax[2], ax[3]);
         }
       }, 33);
     }
@@ -496,6 +541,7 @@ def jpeg_size(data: bytes) -> tuple[int, int] | None:
     return None
 
 
+@functools.lru_cache(maxsize=1)
 def _coregraphics():
     """CoreGraphics via ctypes (macOS only), or None. Keeps the script stdlib-only."""
     if sys.platform != "darwin":
@@ -526,6 +572,12 @@ def _coregraphics():
     cg.CGDisplayBounds.restype = CGRect
     cg.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, CGPoint, ctypes.c_uint32]
     cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+    cg.CGEventCreate.argtypes = [ctypes.c_void_p]
+    cg.CGEventCreate.restype = ctypes.c_void_p
+    cg.CGEventGetLocation.argtypes = [ctypes.c_void_p]
+    cg.CGEventGetLocation.restype = CGPoint
+    cg.CGEventSetIntegerValueField.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64]
+    cg.CGEventSetIntegerValueField.restype = None
     cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
     cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
     cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
@@ -630,13 +682,17 @@ MAC_KEYCODES = {
     "left": 123, "right": 124, "down": 125, "up": 126,
 }
 
+# Keymap targets that are mouse buttons rather than keys (CGMouseButton numbers).
+MOUSE_BUTTONS = {"mouse-left": 0, "mouse-right": 1}
+
 # Viewer input names -> Mac keys. Directions come from the stick, D-pad, arrow
 # keys or the touch pad; btn-* are Joy-Con/touch buttons; plain letters and
 # digits come from a USB keyboard on the Switch. Override with --keymap.
 DEFAULT_KEYMAP = {
     "up": "w", "left": "a", "down": "s", "right": "d",
     "btn-a": "space", "btn-b": "e", "btn-x": "f", "btn-y": "r",
-    "btn-l": "q", "btn-r": "tab", "btn-zl": "shift", "btn-zr": "ctrl",
+    "btn-l": "q", "btn-r": "tab", "btn-zl": "shift", "btn-zr": "mouse-left",
+    "btn-rstick": "mouse-left",
     "btn-plus": "escape", "btn-minus": "m",
     "enter": "return", "space": "space", "escape": "escape", "tab": "tab",
     "backspace": "delete", "shift": "shift",
@@ -655,11 +711,11 @@ def parse_keymap(specs: list[str]) -> dict[str, str]:
                 raise SystemExit(f"--keymap: expected name=key, got {item!r}")
             if key == "none":
                 keymap.pop(name, None)
-            elif key in MAC_KEYCODES:
+            elif key in MAC_KEYCODES or key in MOUSE_BUTTONS:
                 keymap[name] = key
             else:
                 raise SystemExit(f"--keymap: unknown Mac key {key!r} "
-                                 f"(known: {', '.join(sorted(MAC_KEYCODES))})")
+                                 f"(known: {', '.join(sorted([*MAC_KEYCODES, *MOUSE_BUTTONS]))})")
     return keymap
 
 
@@ -675,23 +731,74 @@ def quartz_key(code: int, down: bool) -> None:
     q.cf.CFRelease(event)
 
 
+def _pointer_location(q):
+    event = q.cg.CGEventCreate(None)
+    if not event:
+        raise OSError("CGEventCreate failed")
+    location = q.cg.CGEventGetLocation(event)
+    q.cf.CFRelease(event)
+    return location
+
+
+def quartz_mouse_button(button: int, down: bool) -> None:
+    """Press or release a mouse button wherever the pointer is now."""
+    q = _coregraphics()
+    if q is None:
+        raise OSError("CoreGraphics unavailable")
+    # kCGEventLeftMouseDown/Up = 1/2, kCGEventRightMouseDown/Up = 3/4
+    kind = (1 if down else 2) if button == 0 else (3 if down else 4)
+    event = q.cg.CGEventCreateMouseEvent(None, kind, _pointer_location(q), button)
+    if not event:
+        raise OSError("CGEventCreateMouseEvent failed")
+    q.cg.CGEventPost(0, event)
+    q.cf.CFRelease(event)
+
+
+def quartz_mouse_move(dx: int, dy: int, bounds: tuple[int, int, int, int] | None,
+                      kind: int, button: int) -> None:
+    """Move the pointer by (dx, dy), staying inside bounds (x, y, width, height)."""
+    q = _coregraphics()
+    if q is None:
+        raise OSError("CoreGraphics unavailable")
+    location = _pointer_location(q)
+    x, y = location.x + dx, location.y + dy
+    if bounds:
+        bx, by, bw, bh = bounds
+        x, y = min(max(x, bx), bx + bw - 1), min(max(y, by), by + bh - 1)
+    event = q.cg.CGEventCreateMouseEvent(None, kind, q.CGPoint(x, y), button)
+    if not event:
+        raise OSError("CGEventCreateMouseEvent failed")
+    # explicit deltas: a game that captures the pointer reads these, not the position
+    q.cg.CGEventSetIntegerValueField(event, 4, dx)  # kCGMouseEventDeltaX
+    q.cg.CGEventSetIntegerValueField(event, 5, dy)  # kCGMouseEventDeltaY
+    q.cg.CGEventPost(0, event)
+    q.cf.CFRelease(event)
+
+
 class KeyInjector:
-    """Joy-Con/touch input -> held Mac keys, restricted to a keymap.
+    """Joy-Con/touch input -> held Mac keys and pointer motion, restricted to a keymap.
 
     The viewer re-sends "down" for every held input twice a second; an input
     not refreshed within hold_s is released. A dropped Wi-Fi link or a closed
     applet therefore cannot leave W held down on the Mac.
     """
 
+    MAX_MOVE = 400  # points per message; a viewer can't fling the pointer further
+
     def __init__(self, keymap: dict[str, str], dry_run: bool, hold_s: float = 1.5,
-                 poster=None):
+                 poster=None, button_poster=None, mover=None,
+                 bounds: tuple[int, int, int, int] | None = None):
         self.keymap = keymap
         self.dry_run = dry_run
         self.hold_s = hold_s
         self.poster = poster or quartz_key
+        self.button_poster = button_poster or quartz_mouse_button
+        self.mover = mover or quartz_mouse_move
+        self.bounds = bounds
         self.stats = {"received": 0, "pressed": 0, "released": 0, "unmapped": 0,
-                      "expired": 0, "failed": 0}
+                      "expired": 0, "failed": 0, "moves": 0}
         self.seen: dict[str, int] = {}
+        self.probe: dict[str, int] = {}
         self.connections = 0
         self._holders: dict[str, dict[tuple, float]] = {}  # mac key -> {(conn, name): t}
         self._lock = threading.Lock()
@@ -703,9 +810,36 @@ class KeyInjector:
         if self.dry_run:
             return
         try:
-            self.poster(MAC_KEYCODES[key], down)
+            if key in MOUSE_BUTTONS:
+                self.button_poster(MOUSE_BUTTONS[key], down)
+            else:
+                self.poster(MAC_KEYCODES[key], down)
         except OSError:
             self.stats["failed"] += 1
+
+    def move(self, dx: int, dy: int) -> str | None:
+        """Move the pointer by a viewer delta; returns an error for the viewer, or None."""
+        dx = max(-self.MAX_MOVE, min(self.MAX_MOVE, dx))
+        dy = max(-self.MAX_MOVE, min(self.MAX_MOVE, dy))
+        with self._lock:
+            self.stats["moves"] += 1
+            if self.dry_run:
+                return None
+            if accessibility_trusted() is False:
+                self.stats["failed"] += 1
+                return "Accessibility permission missing"
+            # a held button turns motion into a drag; 5/6/7 = moved, left/right dragged
+            if "mouse-left" in self._holders:
+                kind, button = 6, 0
+            elif "mouse-right" in self._holders:
+                kind, button = 7, 1
+            else:
+                kind, button = 5, 0
+            try:
+                self.mover(dx, dy, self.bounds, kind, button)
+            except OSError:
+                self.stats["failed"] += 1
+        return None
 
     def press(self, conn, name: str, down: bool) -> str | None:
         """Apply one input event; returns an error for the viewer, or None."""
@@ -733,6 +867,17 @@ class KeyInjector:
                 del self._holders[key]
                 self._post(key, False)
         return None
+
+    def note_probe(self, item: str) -> None:
+        """Record a viewer 'event=count' total, logging each event type once."""
+        name, _, count = item.partition("=")
+        name = name[:32]
+        if not count.isdigit() or (name not in self.probe and len(self.probe) >= 32):
+            return
+        with self._lock:
+            if name not in self.probe:
+                print(f"[probe] page received '{name}'", flush=True)
+            self.probe[name] = int(count)
 
     def release_all(self, conn) -> None:
         with self._lock:
@@ -768,7 +913,8 @@ class KeyInjector:
     def snapshot(self) -> dict:
         with self._lock:
             return {"connections": self.connections, "held": sorted(self._holders),
-                    "stats": dict(self.stats), "seen": dict(self.seen)}
+                    "stats": dict(self.stats), "seen": dict(self.seen),
+                    "probe": dict(self.probe)}
 
 
 class Clicker:
@@ -1372,7 +1518,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 self.send_error(404)
 
         def _input(self) -> None:
-            """Joy-Con/touch input socket: 'auth:<secret>', then 'd:<name>' / 'u:<name>'."""
+            """Input socket: 'auth:<secret>', then 'd:<name>', 'u:<name>', 'm:<dx>,<dy>', 'p:<probe>'."""
             if injector is None or clicker is None:
                 self.send_error(403, "input is disabled (start with --keys)")
                 return
@@ -1416,7 +1562,17 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                         if budget < 1:
                             continue  # over budget: drop; held keys still expire
                         budget -= 1
-                        if text[:2] in ("d:", "u:"):
+                        if text.startswith("p:"):
+                            injector.note_probe(text[2:])
+                        elif text.startswith("m:"):
+                            dx, _, dy = text[2:].partition(",")
+                            try:
+                                err = injector.move(int(dx), int(dy))
+                            except ValueError:
+                                continue
+                            if err:
+                                ws_send_frame(self.connection, b"err:" + err.encode(), 0x1)
+                        elif text[:2] in ("d:", "u:"):
                             err = injector.press(conn, text[2:], text[0] == "d")
                             if err:
                                 ws_send_frame(self.connection, b"err:" + err.encode(), 0x1)
@@ -1660,8 +1816,9 @@ def main() -> int:
                          "(needs --click-secret; only keys in the keymap can be pressed)")
     ap.add_argument("--keymap", action="append", default=[], metavar="NAME=KEY,...",
                     help="remap inputs, e.g. 'btn-a=e,up=up'; KEY 'none' unmaps "
-                         "(default: stick/D-pad -> WASD, A space, B e, X f, Y r, "
-                         "L q, R tab, ZL shift, ZR ctrl, + escape, - m)")
+                         "(default: left stick/D-pad -> WASD, A space, B e, X f, Y r, "
+                         "L q, R tab, ZL shift, ZR and right-stick press mouse-left, "
+                         "+ escape, - m; the right stick moves the pointer)")
     ap.add_argument("--allow-host", action="append", default=[],
                     help="additional HTTP Host name allowed (repeatable)")
     ap.add_argument("--click-allow", action="append", default=[], metavar="IP",
@@ -1718,7 +1875,9 @@ def main() -> int:
     if args.keys:
         if not clicker:
             raise SystemExit("--keys needs --click-secret (or SWITCHDISPLAY_SECRET)")
-        injector = KeyInjector(parse_keymap(args.keymap), dry_run=args.click_dry_run)
+        injector = KeyInjector(parse_keymap(args.keymap), dry_run=args.click_dry_run,
+                               bounds=(*clicker.origin, *clicker.display_size)
+                               if clicker.display_size else None)
     lan_ip = _lan_ip()
     if clicker and args.bind == "0.0.0.0":
         args.bind = lan_ip
@@ -1767,7 +1926,8 @@ def main() -> int:
         print("[click] tap-to-click OFF (no --click-secret / SWITCHDISPLAY_SECRET)", flush=True)
     if injector:
         shown = ("up", "left", "down", "right", "btn-a", "btn-b", "btn-x", "btn-y",
-                 "btn-l", "btn-r", "btn-zl", "btn-zr", "btn-plus", "btn-minus", "enter")
+                 "btn-l", "btn-r", "btn-zl", "btn-zr", "btn-rstick", "btn-plus", "btn-minus",
+                 "enter")
         print(f"[keys] Joy-Con/touch input ON{' (DRY RUN)' if args.click_dry_run else ''}: " +
               " ".join(f"{n}={injector.keymap[n]}" for n in shown if n in injector.keymap),
               flush=True)
