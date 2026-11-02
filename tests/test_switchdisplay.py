@@ -227,6 +227,57 @@ class Tests(unittest.TestCase):
         finally:
             inj.close()
 
+    def test_frontmost_pid_parses_both_lsappinfo_formats(self):
+        for output in ('"pid"=4242\n', '[ NULL ]\n    pid = 4242 !cgsConnection type=[ NULL ]\n'):
+            result = SimpleNamespace(stdout=output)
+            with unittest.mock.patch("subprocess.run", return_value=result):
+                self.assertEqual(switchdisplay._frontmost_pid(), 4242)
+        with unittest.mock.patch("subprocess.run", return_value=SimpleNamespace(stdout="nope")):
+            self.assertIsNone(switchdisplay._frontmost_pid())
+
+    def test_clean_text_removes_control_characters(self):
+        self.assertEqual(switchdisplay.clean_text("hi\r\n\tthere\x1b\u2028 \U0001F600"),
+                         "hithere \U0001F600")
+        self.assertEqual(len(switchdisplay.clean_text("x" * 5000)), switchdisplay.MAX_TEXT)
+
+    def test_text_needs_opt_in_and_accessibility(self):
+        typed = []
+        off = switchdisplay.KeyInjector({}, dry_run=False, text_poster=typed.append)
+        on = switchdisplay.KeyInjector({}, dry_run=False, text_poster=typed.append, text_enabled=True)
+        try:
+            with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=True):
+                off.type_text("no")
+                self.assertEqual(typed, [])
+                on.type_text("h\ri")
+                self.assertEqual(typed, ["hi"])
+            with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=False):
+                self.assertIn("Accessibility", on.type_text("x"))
+                self.assertEqual(typed, ["hi"])
+        finally:
+            off.close(); on.close()
+
+    def test_click_prompts_keyboard_only_for_text_fields(self):
+        checks = [True, False]
+        reader, writer = socket.socketpair()
+        inj = switchdisplay.KeyInjector(dict(switchdisplay.DEFAULT_KEYMAP), dry_run=True,
+                                        text_enabled=True, focus_check=lambda: checks.pop(0),
+                                        focus_delay_s=0.01)
+        inj.add_socket(writer)
+        try:
+            conn = object()
+            inj.press(conn, "btn-zr", True)
+            inj.press(conn, "btn-zr", False)        # text field focused: prompt
+            time.sleep(0.15)
+            self.assertEqual(reader.recv(16), b"\x81\x02kb")
+            inj.after_click()                        # something else focused: no prompt
+            time.sleep(0.15)
+            reader.setblocking(False)
+            with self.assertRaises(BlockingIOError):
+                reader.recv(16)
+            self.assertEqual(inj.stats["keyboard_prompts"], 1)
+        finally:
+            inj.close(); reader.close(); writer.close()
+
     def test_input_socket_requires_secret_and_releases_on_close(self):
         posted = []
         moved = []
@@ -274,6 +325,9 @@ class Tests(unittest.TestCase):
         self.assertIn("var INPUT_ON = true;", on)
         self.assertIn("var INPUT_ON = false;", off)
         self.assertIn("padSeen && name === 'enter'", on)  # A must not also press Return
+        self.assertIn("var TEXT_ON = false;", on)
+        self.assertIn("var TEXT_ON = true;", switchdisplay.render_viewer(True, "s", True, True).decode())
+        self.assertIn("var TEXT_ON = false;", switchdisplay.render_viewer(False, "", False, True).decode())
 
     def test_mac_presets_capture_screens_by_name(self):
         args = SimpleNamespace(source=None, preset="mac-mirror", screen=None, display_index=None,

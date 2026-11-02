@@ -161,6 +161,11 @@ held down. Which Joy-Con buttons the Switch's browser passes to a page is not
 documented. The HUD and `/health` `input.seen`/`input.probe` show what arrives, and the
 server log names unmapped inputs (see MAC-SETUP.md, "Joy-Con controls").
 
+`--text` (with `--keys`) adds the Switch's on-screen keyboard: a text box opens on
+the Switch when a click focuses a text field in a normal Mac app, or when you press
+**−** or tap **kbd**, and what you enter is typed on the Mac. It allows any text and
+sends it over plain HTTP, so it's opt-in, and password fields don't open the box.
+
 ### Custom capture (`--source`)
 
 Any command that writes MJPEG to stdout. Placeholders: `{w} {h} {fps}`,

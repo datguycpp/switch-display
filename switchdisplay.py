@@ -30,6 +30,7 @@ import hmac
 import json
 import os
 import queue
+import re
 import shlex
 import shutil
 import socket
@@ -38,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import signal
 import select
 from types import SimpleNamespace
@@ -61,6 +63,12 @@ VIEWER_HTML = b"""<!doctype html>
  #padbtn{position:fixed;right:48px;top:6px;z-index:3;font:14px monospace;color:#8f8;display:none;
    background:rgba(0,0,0,.45);border:1px solid #4a4;border-radius:4px;padding:2px 8px}
  #pad{display:none}
+ #kbd{position:fixed;right:96px;top:6px;z-index:3;font:14px monospace;color:#8f8;display:none;
+   background:rgba(0,0,0,.45);border:1px solid #4a4;border-radius:4px;padding:2px 8px}
+ #kbbar{display:none;position:fixed;left:8%;right:8%;top:36px;z-index:4;padding:8px;
+   background:rgba(0,0,0,.85);border:1px solid #4a4;border-radius:6px}
+ #kbin{width:70%;font:22px sans-serif;padding:6px}
+ #kbgo,#kbno{font:18px sans-serif;padding:6px 10px;margin-left:6px}
  #stick{position:fixed;left:24px;bottom:24px;width:150px;height:150px;border-radius:75px;z-index:3;
    background:rgba(255,255,255,.10);border:2px solid rgba(136,255,136,.45)}
  #knob{position:absolute;left:50px;top:50px;width:50px;height:50px;border-radius:25px;
@@ -75,6 +83,11 @@ VIEWER_HTML = b"""<!doctype html>
 <div id="hud">connecting...</div>
 <div id="fs" class="ui">&#9974;</div>
 <div id="padbtn" class="ui">pad</div>
+<div id="kbd" class="ui">kbd</div>
+<form id="kbbar" class="ui" action="#"><input id="kbin" class="ui" type="text"
+ autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+ placeholder="Type for the Mac"><button id="kbgo" class="ui" type="submit">Send</button><button
+ id="kbno" class="ui" type="button">Close</button></form>
 <div id="pad" class="ui">
  <div id="stick" class="ui"><div id="knob" class="ui"></div></div>
  <div class="pb ui" data-btn="btn-x" style="right:88px;bottom:148px">X</div>
@@ -87,6 +100,7 @@ VIEWER_HTML = b"""<!doctype html>
   var CLICK_ON = __CLICK_ON__;
   var CLICK_SECRET = __CLICK_SECRET__;
   var INPUT_ON = __INPUT_ON__;
+  var TEXT_ON = __TEXT_ON__;
   var hud = document.getElementById('hud');
   var canvas = document.getElementById('c');
   var ctx = canvas.getContext('2d');
@@ -301,7 +315,45 @@ VIEWER_HTML = b"""<!doctype html>
       for (s in h) { if (h.hasOwnProperty(s)) { return true; } }
       return false;
     };
+    // Switch keyboard (--text): the applet opens it for a focused text input.
+    // While the box is open the Joy-Cons belong to the browser, not the Mac.
+    var kbOpen = false, kbToggled = 0, kbin = document.getElementById('kbin');
+    var kbbar = document.getElementById('kbbar');
+    var openKb = function () {
+      if (!TEXT_ON || kbOpen) { return; }
+      releaseAll();
+      kbOpen = true;
+      window.__kbOpen = true;
+      kbbar.style.display = 'block';
+      kbin.value = '';
+      kbin.focus();
+      probe['kb-opened'] = (probe['kb-opened'] || 0) + 1;
+      if (document.activeElement === kbin) { probe['kb-focused'] = (probe['kb-focused'] || 0) + 1; }
+    };
+    var closeKb = function () {
+      kbOpen = false;
+      window.__kbOpen = false;
+      kbbar.style.display = 'none';
+      kbin.blur();
+    };
+    var sendText = function () {
+      if (kbin.value && inReady) {
+        probe['kb-sent'] = (probe['kb-sent'] || 0) + 1;
+        inWs.send('t:' + kbin.value);
+        kbin.value = '';
+      }
+    };
     var press = function (src, name, down) {
+      if (TEXT_ON && name === 'btn-minus') {
+        // debounced: blur and releaseAll make a still-held button look pressed again
+        var at = new Date().getTime();
+        if (down && at - kbToggled > 500) {
+          kbToggled = at;
+          if (kbOpen) { closeKb(); } else { openKb(); }
+        }
+        return;
+      }
+      if (kbOpen && down) { return; }
       var was = anyHeld(name);
       if (down) { if (!held[name]) { held[name] = {}; } held[name][src] = true; }
       else if (held[name]) { delete held[name][src]; }
@@ -345,6 +397,7 @@ VIEWER_HTML = b"""<!doctype html>
       inWs.onmessage = function (ev) {
         var t = String(ev.data);
         if (t === 'ok') { inReady = true; inState = 'keys'; return; }
+        if (t === 'kb') { openKb(); return; }
         if (t.indexOf('err:') === 0) { tapError = t.substring(4); }
       };
       inWs.onclose = function () {
@@ -366,6 +419,7 @@ VIEWER_HTML = b"""<!doctype html>
     };
     var padSeen = false;
     var keyEvent = function (ev, down) {
+      if (ev.target === kbin) { return; }  // typing belongs to the text box
       var name = keyName(ev);
       // In its select mode the applet also turns A into Enter; the gamepad
       // already reports A, so forwarding both would press two Mac keys.
@@ -384,6 +438,7 @@ VIEWER_HTML = b"""<!doctype html>
     var pointerStick = function (rx, ry) {
       var now = new Date().getTime(), dt = Math.min(now - lastPoll, 100) / 1000, mag, dx, dy;
       lastPoll = now;
+      if (kbOpen) { moveX = 0; moveY = 0; return; }
       if (typeof rx !== 'number' || typeof ry !== 'number') { return; }
       mag = Math.sqrt(rx * rx + ry * ry);
       if (mag < STICK_DEAD) { moveX = 0; moveY = 0; return; }
@@ -436,6 +491,31 @@ VIEWER_HTML = b"""<!doctype html>
     };
     padbtn.addEventListener('click', togglePad, false);
     padbtn.addEventListener('touchend', togglePad, false);
+
+    if (TEXT_ON) {
+      var kbd = document.getElementById('kbd');
+      var kbOpenEv = function (ev) {
+        ev.stopPropagation(); if (ev.preventDefault) { ev.preventDefault(); }
+        openKb();
+      };
+      kbd.style.display = 'block';
+      kbd.addEventListener('click', kbOpenEv, false);
+      kbd.addEventListener('touchend', kbOpenEv, false);
+      kbbar.addEventListener('submit', function (ev) {
+        ev.preventDefault(); sendText(); closeKb();
+      }, false);
+      // the applet's keyboard returns its text as a change, so the box is done
+      kbin.addEventListener('change', function () {
+        if (kbin.value) { sendText(); closeKb(); }
+      }, false);
+      var kbno = document.getElementById('kbno');
+      var kbDiscard = function () { kbin.value = ''; };  // before blur can fire change
+      kbno.addEventListener('mousedown', kbDiscard, false);
+      kbno.addEventListener('touchstart', kbDiscard, false);
+      kbno.addEventListener('click', function (ev) {
+        ev.preventDefault(); kbin.value = ''; closeKb();
+      }, false);
+    }
 
     var stickId = null, stickX = 0, stickY = 0;
     var stickMove = function (x, y) {
@@ -506,7 +586,8 @@ VIEWER_HTML = b"""<!doctype html>
 """
 
 
-def render_viewer(click_enabled: bool, secret: str, input_enabled: bool = False) -> bytes:
+def render_viewer(click_enabled: bool, secret: str, input_enabled: bool = False,
+                  text_enabled: bool = False) -> bytes:
     """Inject the click/input flags and secret into the static page (JS literals, JSON-escaped)."""
     literal = json.dumps(secret if click_enabled or input_enabled else "")
     literal = (literal.replace("<", "\\u003c").replace(">", "\\u003e")
@@ -514,6 +595,7 @@ def render_viewer(click_enabled: bool, secret: str, input_enabled: bool = False)
     return (VIEWER_HTML
             .replace(b"__CLICK_ON__", b"true" if click_enabled else b"false")
             .replace(b"__INPUT_ON__", b"true" if input_enabled else b"false")
+            .replace(b"__TEXT_ON__", b"true" if input_enabled and text_enabled else b"false")
             .replace(b"__CLICK_SECRET__", literal.encode()))
 
 
@@ -578,6 +660,9 @@ def _coregraphics():
     cg.CGEventGetLocation.restype = CGPoint
     cg.CGEventSetIntegerValueField.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64]
     cg.CGEventSetIntegerValueField.restype = None
+    cg.CGEventKeyboardSetUnicodeString.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                                   ctypes.POINTER(ctypes.c_uint16)]
+    cg.CGEventKeyboardSetUnicodeString.restype = None
     cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
     cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
     cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
@@ -775,6 +860,115 @@ def quartz_mouse_move(dx: int, dy: int, bounds: tuple[int, int, int, int] | None
     q.cf.CFRelease(event)
 
 
+MAX_TEXT = 1000  # characters per Switch keyboard submission
+
+
+def clean_text(text: str) -> str:
+    """Printable text only: no newline, tab or escape can act as a key press."""
+    return "".join(c for c in text
+                   if unicodedata.category(c) not in ("Cc", "Zl", "Zp"))[:MAX_TEXT]
+
+
+def quartz_text(text: str) -> None:
+    """Type text into the focused app as Unicode key events (needs Accessibility)."""
+    q = _coregraphics()
+    if q is None:
+        raise OSError("CoreGraphics unavailable")
+    chunks, chunk = [], []
+    for char in text:  # a chunk boundary must not split a surrogate pair
+        units = len(char.encode("utf-16-le")) // 2
+        if len(chunk) + units > 20:  # events carry at most 20 UTF-16 units
+            chunks.append(chunk)
+            chunk = []
+        chunk.extend(int.from_bytes(char.encode("utf-16-le")[i:i + 2], "little")
+                     for i in range(0, units * 2, 2))
+    if chunk:
+        chunks.append(chunk)
+    for chunk in chunks:
+        buf = (q.ctypes.c_uint16 * len(chunk))(*chunk)
+        for down in (True, False):
+            event = q.cg.CGEventCreateKeyboardEvent(None, 0, down)
+            if not event:
+                raise OSError("CGEventCreateKeyboardEvent failed")
+            q.cg.CGEventKeyboardSetUnicodeString(event, len(chunk), buf)
+            q.cg.CGEventPost(0, event)
+            q.cf.CFRelease(event)
+        time.sleep(0.01)
+
+
+def _frontmost_pid() -> int | None:
+    """The frontmost app's pid. lsappinfo, as NSWorkspace goes stale without a run loop."""
+    try:
+        front = subprocess.run(["lsappinfo", "front"], capture_output=True, text=True,
+                               timeout=1).stdout.strip()
+        info = subprocess.run(["lsappinfo", "info", "-only", "pid", front], capture_output=True,
+                              text=True, timeout=1).stdout
+        match = re.search(r'\bpid"?\s*=\s*(\d+)', info)  # format varies by macOS version
+        return int(match.group(1)) if match else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def focused_text_field() -> bool | None:
+    """Is a non-password text field focused on the Mac? None if that can't be read.
+
+    Only sees fields exposed through Accessibility: games drawing their own text
+    boxes never match. Password fields don't count, because the Switch keyboard's
+    text would cross the LAN over plain HTTP.
+    """
+    if sys.platform != "darwin":
+        return None
+    import ctypes
+    try:
+        ax = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/"
+                         "ApplicationServices")
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    except OSError:
+        return None
+    utf8 = 0x08000100
+    cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+    cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+    cf.CFStringGetCString.restype = ctypes.c_bool
+    cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    ax.AXUIElementCreateApplication.restype = ctypes.c_void_p
+    ax.AXUIElementCreateApplication.argtypes = [ctypes.c_int32]
+    ax.AXUIElementSetMessagingTimeout.argtypes = [ctypes.c_void_p, ctypes.c_float]
+    ax.AXUIElementCopyAttributeValue.restype = ctypes.c_int32
+    ax.AXUIElementCopyAttributeValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                                 ctypes.POINTER(ctypes.c_void_p)]
+
+    def copy(element, name: bytes):
+        key = cf.CFStringCreateWithCString(None, name, utf8)
+        value = ctypes.c_void_p()
+        err = ax.AXUIElementCopyAttributeValue(element, key, ctypes.byref(value))
+        cf.CFRelease(key)
+        return value.value if err == 0 else None
+
+    def text(element, name: bytes) -> str:
+        value = copy(element, name)
+        if not value:
+            return ""
+        buf = ctypes.create_string_buffer(128)
+        ok = cf.CFStringGetCString(value, buf, 128, utf8)
+        cf.CFRelease(value)
+        return buf.value.decode() if ok else ""
+
+    pid = _frontmost_pid()
+    if pid is None:
+        return None
+    # ask the app itself: the system-wide element fails with -25204 on macOS 27
+    app = ax.AXUIElementCreateApplication(pid)
+    ax.AXUIElementSetMessagingTimeout(app, 0.25)  # a hung app must not stall us
+    focused = copy(app, b"AXFocusedUIElement")
+    cf.CFRelease(app)
+    if not focused:
+        return False
+    role, subrole = text(focused, b"AXRole"), text(focused, b"AXSubrole")
+    cf.CFRelease(focused)
+    return role in ("AXTextField", "AXTextArea", "AXComboBox") and subrole != "AXSecureTextField"
+
+
 class KeyInjector:
     """Joy-Con/touch input -> held Mac keys and pointer motion, restricted to a keymap.
 
@@ -787,7 +981,9 @@ class KeyInjector:
 
     def __init__(self, keymap: dict[str, str], dry_run: bool, hold_s: float = 1.5,
                  poster=None, button_poster=None, mover=None,
-                 bounds: tuple[int, int, int, int] | None = None):
+                 bounds: tuple[int, int, int, int] | None = None,
+                 text_enabled: bool = False, text_poster=None, focus_check=None,
+                 focus_delay_s: float = 0.25):
         self.keymap = keymap
         self.dry_run = dry_run
         self.hold_s = hold_s
@@ -795,8 +991,13 @@ class KeyInjector:
         self.button_poster = button_poster or quartz_mouse_button
         self.mover = mover or quartz_mouse_move
         self.bounds = bounds
+        self.text_enabled = text_enabled
+        self.text_poster = text_poster or quartz_text
+        self.focus_check = focus_check or focused_text_field
+        self.focus_delay_s = focus_delay_s
+        self._sockets: dict[socket.socket, threading.Lock] = {}
         self.stats = {"received": 0, "pressed": 0, "released": 0, "unmapped": 0,
-                      "expired": 0, "failed": 0, "moves": 0}
+                      "expired": 0, "failed": 0, "moves": 0, "typed": 0, "keyboard_prompts": 0}
         self.seen: dict[str, int] = {}
         self.probe: dict[str, int] = {}
         self.connections = 0
@@ -816,6 +1017,54 @@ class KeyInjector:
                 self.poster(MAC_KEYCODES[key], down)
         except OSError:
             self.stats["failed"] += 1
+
+    def type_text(self, text: str) -> str | None:
+        """Type Switch keyboard text on the Mac; returns an error for the viewer, or None."""
+        if not self.text_enabled:
+            return None
+        text = clean_text(text)
+        if not text:
+            return None
+        with self._lock:
+            self.stats["typed"] += len(text)
+            if self.dry_run:
+                return None
+            if accessibility_trusted() is False:
+                self.stats["failed"] += 1
+                return "Accessibility permission missing"
+            try:
+                self.text_poster(text)
+            except OSError:
+                self.stats["failed"] += 1
+        return None
+
+    def add_socket(self, sock: socket.socket) -> threading.Lock:
+        lock = threading.Lock()
+        with self._lock:
+            self._sockets[sock] = lock
+        return lock
+
+    def remove_socket(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._sockets.pop(sock, None)
+
+    def after_click(self) -> None:
+        """A click just happened: if it focused a text field, prompt the viewer."""
+        if self.text_enabled:
+            threading.Timer(self.focus_delay_s, self._prompt_if_text_field).start()
+
+    def _prompt_if_text_field(self) -> None:
+        if not self.focus_check():
+            return
+        with self._lock:
+            self.stats["keyboard_prompts"] += 1
+            sockets = list(self._sockets.items())
+        for sock, lock in sockets:
+            try:
+                with lock:
+                    ws_send_frame(sock, b"kb", 0x1)
+            except OSError:
+                pass
 
     def move(self, dx: int, dy: int) -> str | None:
         """Move the pointer by a viewer delta; returns an error for the viewer, or None."""
@@ -866,6 +1115,8 @@ class KeyInjector:
             elif holders.pop((conn, name), None) is not None and not holders:
                 del self._holders[key]
                 self._post(key, False)
+                if key == "mouse-left":
+                    self.after_click()
         return None
 
     def note_probe(self, item: str) -> None:
@@ -1389,6 +1640,8 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 self._json(400, {"error": "x and y are required numbers"})
                 return
             code, body = clicker.click(self.client_address[0], x, y, hub.frame_size)
+            if code == 200 and injector:
+                injector.after_click()
             self._json(code, body)
 
         def do_GET(self):
@@ -1398,7 +1651,8 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
             if path == "/":
                 allowed = clicker is not None and self._click_client_ok()
                 page = render_viewer(allowed, clicker.secret if clicker else "",
-                                     allowed and injector is not None)
+                                     allowed and injector is not None,
+                                     allowed and injector is not None and injector.text_enabled)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(page)))
@@ -1518,7 +1772,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 self.send_error(404)
 
         def _input(self) -> None:
-            """Input socket: 'auth:<secret>', then 'd:<name>', 'u:<name>', 'm:<dx>,<dy>', 'p:<probe>'."""
+            """Input socket: 'auth:<secret>', then 'd:<name>', 'u:<name>', 'm:<dx>,<dy>', 't:<text>', 'p:<probe>'."""
             if injector is None or clicker is None:
                 self.send_error(403, "input is disabled (start with --keys)")
                 return
@@ -1533,6 +1787,11 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
             parser = WSClientParser()
             authed = False
             budget, refill = 60.0, time.monotonic()  # ~60 events/s per socket
+            send_lock = injector.add_socket(self.connection)
+
+            def send(payload: bytes, opcode: int = 0x1) -> None:
+                with send_lock:  # a keyboard prompt may arrive from a timer thread
+                    ws_send_frame(self.connection, payload, opcode)
             with injector._lock:
                 injector.connections += 1
             try:
@@ -1542,19 +1801,19 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                         return
                     for kind, payload in parser.feed(data):
                         if kind == "close":
-                            ws_send_frame(self.connection, payload[:125], 0x8)
+                            send(payload[:125], 0x8)
                             return
                         if kind == "ping":
-                            ws_send_frame(self.connection, payload[:125], 0xA)
+                            send(payload[:125], 0xA)
                             continue
                         text = payload.decode("utf-8", "ignore")
                         if not authed:
                             if text.startswith("auth:") and clicker.check_secret(text[5:]):
                                 authed = True
-                                ws_send_frame(self.connection, b"ok", 0x1)
+                                send(b"ok")
                                 continue
                             clicker.reject(ip)
-                            ws_send_frame(self.connection, b"err:bad secret", 0x1)
+                            send(b"err:bad secret")
                             return
                         now = time.monotonic()
                         budget = min(60.0, budget + (now - refill) * 60.0)
@@ -1571,14 +1830,19 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                             except ValueError:
                                 continue
                             if err:
-                                ws_send_frame(self.connection, b"err:" + err.encode(), 0x1)
+                                send(b"err:" + err.encode())
+                        elif text.startswith("t:"):
+                            err = injector.type_text(text[2:])
+                            if err:
+                                send(b"err:" + err.encode())
                         elif text[:2] in ("d:", "u:"):
                             err = injector.press(conn, text[2:], text[0] == "d")
                             if err:
-                                ws_send_frame(self.connection, b"err:" + err.encode(), 0x1)
+                                send(b"err:" + err.encode())
             except (OSError, ValueError):
                 pass
             finally:
+                injector.remove_socket(self.connection)
                 injector.release_all(conn)
                 with injector._lock:
                     injector.connections -= 1
@@ -1819,6 +2083,10 @@ def main() -> int:
                          "(default: left stick/D-pad -> WASD, A space, B e, X f, Y r, "
                          "L q, R tab, ZL shift, ZR and right-stick press mouse-left, "
                          "+ escape, - m; the right stick moves the pointer)")
+    ap.add_argument("--text", action="store_true",
+                    help="with --keys: type Switch keyboard text on the Mac, opening the "
+                         "keyboard when a click focuses a text field. Allows any text, "
+                         "beyond the keymap; it crosses the LAN over plain HTTP")
     ap.add_argument("--allow-host", action="append", default=[],
                     help="additional HTTP Host name allowed (repeatable)")
     ap.add_argument("--click-allow", action="append", default=[], metavar="IP",
@@ -1872,12 +2140,15 @@ def main() -> int:
             dry_run=args.click_dry_run,
         )
     injector = None
+    if args.text and not args.keys:
+        raise SystemExit("--text needs --keys")
     if args.keys:
         if not clicker:
             raise SystemExit("--keys needs --click-secret (or SWITCHDISPLAY_SECRET)")
         injector = KeyInjector(parse_keymap(args.keymap), dry_run=args.click_dry_run,
                                bounds=(*clicker.origin, *clicker.display_size)
-                               if clicker.display_size else None)
+                               if clicker.display_size else None,
+                               text_enabled=args.text)
     lan_ip = _lan_ip()
     if clicker and args.bind == "0.0.0.0":
         args.bind = lan_ip
@@ -1929,8 +2200,12 @@ def main() -> int:
                  "btn-l", "btn-r", "btn-zl", "btn-zr", "btn-rstick", "btn-plus", "btn-minus",
                  "enter")
         print(f"[keys] Joy-Con/touch input ON{' (DRY RUN)' if args.click_dry_run else ''}: " +
-              " ".join(f"{n}={injector.keymap[n]}" for n in shown if n in injector.keymap),
+              " ".join(f"{n}={injector.keymap[n]}" for n in shown if n in injector.keymap
+                       and not (args.text and n == "btn-minus")),  # the viewer keeps - for the keyboard
               flush=True)
+        if args.text:
+            print("[text] Switch keyboard ON: - or kbd opens it; any text can be typed on this "
+                  "Mac, sent over plain HTTP", flush=True)
     def _terminate(signum, frame):
         raise KeyboardInterrupt  # run the finally below: ffmpeg is in its own session
     signal.signal(signal.SIGTERM, _terminate)

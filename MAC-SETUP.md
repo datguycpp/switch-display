@@ -249,6 +249,26 @@ This includes the Enter key on a USB keyboard.
   bottom-left and A/B/X/Y bottom-right; they work with several fingers at once
   and never send taps. Tap **pad** again to hide it (that releases everything).
 
+**Switch keyboard (`--text`, optional).** Add `--text` to `--keys` to type on the
+Mac with the Switch's on-screen keyboard:
+
+* **Automatic:** when a click or tap focuses a text field in a normal Mac app, a
+  text box opens on the Switch. Games that draw their own text boxes aren't
+  visible to macOS, so this doesn't trigger there.
+* **By hand:** press **−** or tap **kbd** at any time. **−** no longer sends M in
+  this mode, and pressing it again closes the box.
+* The Switch's keyboard opens with the box (confirmed on a console). If it doesn't,
+  tap the box, or press **A** on it with the left stick in select mode (press the
+  left stick in). The Joy-Cons don't control the Mac while the box is open.
+
+The text is typed where the Mac's focus is, without pressing Return, so a chat box
+still needs a key mapped for that, for example `--keymap btn-plus=return`. Tabs and
+line breaks are removed.
+
+`--text` allows any text, not just the keymap, and the text crosses your network
+over **plain HTTP**. Don't type passwords with it. Password fields don't open the
+box, though **−** still can. Some games may read the text as repeated key presses.
+
 **Find out what each Joy-Con button sends.** Press each button once with the
 viewer open, then check any of these:
 
@@ -258,8 +278,8 @@ viewer open, then check any of these:
 * the server log: `[keys] unmapped input 'k113' (map it with --keymap k113=KEY)`
 * `curl -s http://<mac-lan-ip>:80/health`, whose `"input": {"seen": {...}}`
   counts every name received, `"probe"` counts every event type the page received
-  (including `gamepad-axes` and `right-stick`), and `"stats"."moves"` counts
-  pointer moves
+  (including `gamepad-axes`, `right-stick`, `kb-opened` and `kb-sent`), and
+  `"stats"` counts pointer `moves`, `typed` characters and `keyboard_prompts`
 
 Then map what you found, for example `--keymap k113=space`. A button the
 browser keeps for itself (Home always, possibly B for "back") never reaches
