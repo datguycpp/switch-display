@@ -117,6 +117,41 @@ pass `--click-display-size WxH --click-display-origin X,Y`. A negative origin
 
 ---
 
+## Filling the Switch screen
+
+A display that isn't 16:9, like a 1920×1243 MacBook screen, shows black bars on the
+Switch. Tap **fill** at the top right of the viewer to switch live, or set the
+starting mode with `--fill`:
+
+| Mode | Result |
+|---|---|
+| `fit` (default) | Shows everything, with black bars |
+| `crop` | Fills the screen and cuts off what overflows. On a 1920×1243 screen that's about 81 points at the top and at the bottom, which can include the menu bar and Dock. The pointer can move into the cut-off area |
+| `stretch` | Fills the screen and shows everything, but changes the shape (about 15% wider on a 1920×1243 screen). Starting with `--fill stretch` also encodes frames at the full size, which is sharper than switching to it with the button |
+
+Taps land in the right place in all three. A 16:9 display needs neither: use a 16:9
+external monitor or dummy display with `--screen N`.
+
+---
+
+## Making text readable
+
+From most to least effect:
+
+1. **Make text bigger on the Mac:** System Settings → Displays → choose a setting
+   toward **Larger Text**. A 1920×1243 screen shown 648 high is drawn at about half
+   size, so a lower "looks like" resolution helps more than any encoder setting.
+2. **Use `--profile text`:** frames are sized for the Switch viewer's 1280×648, so the
+   browser draws them close to 1:1, with better scaling, light sharpening and quality 85.
+3. **Use `--fill crop`:** the picture is drawn about 28% larger than `fit`, at the cost
+   of the cut-off edges.
+
+`--profile text` sends about twice the data per frame, and three times with `--fill
+crop`, so the Switch may draw fewer frames. If it drops too far, add `--fps 20` or
+lower `--quality`.
+
+---
+
 ## Switch-side steps (same for both modes)
 
 1. **System Settings → Internet → Internet Settings →** your Wi‑Fi →
@@ -230,7 +265,9 @@ bracketleft bracketright backslash grave`, plus `mouse-left` and `mouse-right`
 press can never send Cmd+Q.
 
 The pointer stays on the screen being shown on the Switch, and a small tilt moves
-it slowly for aiming. Moves also carry relative motion, which games that capture
+it slowly for aiming. The Mac's arrow is only a few pixels tall on the Switch and
+games may hide it, so a yellow marker shows where the right stick put it, then fades
+after 2.5 s. Moves also carry relative motion, which games that capture
 the mouse for camera control read, but that hasn't been tried in a game. Two
 quick clicks don't count as a macOS double-click yet.
 
@@ -320,6 +357,7 @@ good and the problem is the Switch's DNS/applet step.
 | Switch shows "Could not connect" | Mac firewall blocked `python3`, or the router has client isolation, or Mac and Switch are on different subnets/SSIDs |
 | Stream works on the phone but not the Switch | re-check primary DNS is exactly `<mac-lan-ip>`, secondary `8.8.8.8`, and that the applet (not a normal page) is what opened |
 | Very low fps | expected — the Switch's WebKit has **no JIT**; drop `--width/--height` (e.g. 800×450) or `--fps 10`, or lower `--quality` |
+| Words are hard to read | see [Making text readable](#making-text-readable) |
 | Tap does nothing | HUD says `Accessibility permission missing` → grant it to the terminal, restart the terminal and the server. HUD says "view only" → `--click-secret` was not passed. HUD says `bad secret` → the secret in the page is stale, reload the applet |
 | Clicks land offset by a constant amount | `--click-display-size` is in **points**, not Retina pixels; for a dummy also set `--click-display-origin` |
 | `403 bad secret` in `/health` counters | page and server secrets differ — restart the server and reload the applet |

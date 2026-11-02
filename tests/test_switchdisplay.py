@@ -69,6 +69,18 @@ class Tests(unittest.TestCase):
         # without passthrough ffmpeg duplicates AVFoundation frames to ~680 fps
         self.assertEqual(mac[mac.index("-fps_mode") + 1], "passthrough")
 
+    def test_text_profile_uses_clear_scaling(self):
+        args = SimpleNamespace(source=None, preset="mac-mirror", screen=None, display_index=None,
+                               width=1280, height=648, fps=30, quality=85, static=True, profile="text")
+        cmd = switchdisplay.resolve_capture(args)
+        vf = cmd[cmd.index("-vf") + 1]
+        self.assertIn("flags=lanczos,unsharp=3:3:0.5", vf)
+        self.assertLess(vf.index("unsharp"), vf.index("mpdecimate"))
+        self.assertEqual(cmd[cmd.index("-q:v") + 1], "5")
+        args.profile = None
+        cmd = switchdisplay.resolve_capture(args)
+        self.assertIn("flags=fast_bilinear", cmd[cmd.index("-vf") + 1])
+
     def test_profile_sizes_and_explicit_override(self):
         self.assertEqual((1280, 720), {"sharp": (1280, 720),
                                        "balanced": (960, 540), "low": (800, 450)}["sharp"])
@@ -278,6 +290,30 @@ class Tests(unittest.TestCase):
         finally:
             inj.close(); reader.close(); writer.close()
 
+    def test_pointer_position_reported_for_viewer(self):
+        inj = switchdisplay.KeyInjector({}, dry_run=False, bounds=(1920, 27, 1920, 1080),
+                                        mover=lambda *a: (2880.0, 567.0))
+        none = switchdisplay.KeyInjector({}, dry_run=False, mover=lambda *a: (5.0, 5.0))
+        try:
+            self.assertIsNone(inj.pointer_message())
+            with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=True):
+                inj.move(1, 1); none.move(1, 1)
+            self.assertEqual(inj.pointer_message(), b"c:0.5000,0.5000")
+            self.assertIsNone(none.pointer_message())  # unknown screen: no marker
+        finally:
+            inj.close(); none.close()
+
+    def test_stretch_encodes_the_exact_frame_size(self):
+        args = SimpleNamespace(source=None, preset="mac-mirror", screen=None, display_index=None,
+                               width=1280, height=648, fps=30, quality=85, static=False,
+                               profile="text", fill="stretch")
+        cmd = switchdisplay.resolve_capture(args)
+        vf = cmd[cmd.index("-vf") + 1]
+        self.assertTrue(vf.startswith("scale=1280:648:flags=lanczos"))
+        args.fill = "fit"
+        cmd = switchdisplay.resolve_capture(args)
+        self.assertIn("force_original_aspect_ratio", cmd[cmd.index("-vf") + 1])
+
     def test_input_socket_requires_secret_and_releases_on_close(self):
         posted = []
         moved = []
@@ -326,6 +362,8 @@ class Tests(unittest.TestCase):
         self.assertIn("var INPUT_ON = false;", off)
         self.assertIn("padSeen && name === 'enter'", on)  # A must not also press Return
         self.assertIn("var TEXT_ON = false;", on)
+        self.assertIn('var fill = "fit";', on)
+        self.assertIn('var fill = "crop";', switchdisplay.render_viewer(True, "s", fill="crop").decode())
         self.assertIn("var TEXT_ON = true;", switchdisplay.render_viewer(True, "s", True, True).decode())
         self.assertIn("var TEXT_ON = false;", switchdisplay.render_viewer(False, "", False, True).decode())
 
