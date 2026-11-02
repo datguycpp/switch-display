@@ -8,6 +8,7 @@ import time
 import unittest
 import unittest.mock
 import struct
+import subprocess
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 
@@ -68,6 +69,18 @@ class Tests(unittest.TestCase):
         self.assertLess(vf.index("scale="), vf.index("mpdecimate"))
         # without passthrough ffmpeg duplicates AVFoundation frames to ~680 fps
         self.assertEqual(mac[mac.index("-fps_mode") + 1], "passthrough")
+
+    def test_text_profile_uses_clear_scaling(self):
+        args = SimpleNamespace(source=None, preset="mac-mirror", screen=None, display_index=None,
+                               width=1280, height=648, fps=30, quality=85, static=True, profile="text")
+        cmd = switchdisplay.resolve_capture(args)
+        vf = cmd[cmd.index("-vf") + 1]
+        self.assertIn("flags=lanczos,unsharp=3:3:0.5", vf)
+        self.assertLess(vf.index("unsharp"), vf.index("mpdecimate"))
+        self.assertEqual(cmd[cmd.index("-q:v") + 1], "5")
+        args.profile = None
+        cmd = switchdisplay.resolve_capture(args)
+        self.assertIn("flags=fast_bilinear", cmd[cmd.index("-vf") + 1])
 
     def test_profile_sizes_and_explicit_override(self):
         self.assertEqual((1280, 720), {"sharp": (1280, 720),
@@ -278,6 +291,30 @@ class Tests(unittest.TestCase):
         finally:
             inj.close(); reader.close(); writer.close()
 
+    def test_pointer_position_reported_for_viewer(self):
+        inj = switchdisplay.KeyInjector({}, dry_run=False, bounds=(1920, 27, 1920, 1080),
+                                        mover=lambda *a: (2880.0, 567.0))
+        none = switchdisplay.KeyInjector({}, dry_run=False, mover=lambda *a: (5.0, 5.0))
+        try:
+            self.assertIsNone(inj.pointer_message())
+            with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=True):
+                inj.move(1, 1); none.move(1, 1)
+            self.assertEqual(inj.pointer_message(), b"c:0.5000,0.5000")
+            self.assertIsNone(none.pointer_message())  # unknown screen: no marker
+        finally:
+            inj.close(); none.close()
+
+    def test_stretch_encodes_the_exact_frame_size(self):
+        args = SimpleNamespace(source=None, preset="mac-mirror", screen=None, display_index=None,
+                               width=1280, height=648, fps=30, quality=85, static=False,
+                               profile="text", fill="stretch")
+        cmd = switchdisplay.resolve_capture(args)
+        vf = cmd[cmd.index("-vf") + 1]
+        self.assertTrue(vf.startswith("scale=1280:648:flags=lanczos"))
+        args.fill = "fit"
+        cmd = switchdisplay.resolve_capture(args)
+        self.assertIn("force_original_aspect_ratio", cmd[cmd.index("-vf") + 1])
+
     def test_input_socket_requires_secret_and_releases_on_close(self):
         posted = []
         moved = []
@@ -326,6 +363,8 @@ class Tests(unittest.TestCase):
         self.assertIn("var INPUT_ON = false;", off)
         self.assertIn("padSeen && name === 'enter'", on)  # A must not also press Return
         self.assertIn("var TEXT_ON = false;", on)
+        self.assertIn('var fill = "fit";', on)
+        self.assertIn('var fill = "crop";', switchdisplay.render_viewer(True, "s", fill="crop").decode())
         self.assertIn("var TEXT_ON = true;", switchdisplay.render_viewer(True, "s", True, True).decode())
         self.assertIn("var TEXT_ON = false;", switchdisplay.render_viewer(False, "", False, True).decode())
 
@@ -383,6 +422,61 @@ class Tests(unittest.TestCase):
         finally:
             server.close()
             reader.close()
+
+    def test_capture_never_reads_the_terminal_and_warns_without_frames(self):
+        hub = switchdisplay.Hub(["sleep", "2"])
+        hub.no_frames_warn_s = 0.05
+        with unittest.mock.patch("builtins.print") as printed:
+            hub.start()
+            try:
+                self.assertEqual(hub.proc.stdin, None)
+                # no reader threads: they would spin forever on a fake process's output
+                with unittest.mock.patch("subprocess.Popen") as popen, \
+                        unittest.mock.patch.object(switchdisplay.threading, "Thread"):
+                    switchdisplay.Hub(["x"]).start()
+                self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+                time.sleep(0.3)
+            finally:
+                hub.stop()
+        self.assertIn("no frames", " ".join(str(c.args[0]) for c in printed.call_args_list))
+
+    def test_second_interrupt_while_stopping_still_kills_capture(self):
+        hub = switchdisplay.Hub(["sleep", "30"])
+        hub.no_frames_warn_s = 30
+        hub.start()
+        real_wait = hub.proc.wait
+        calls = []
+
+        def interrupted(timeout=None):
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise KeyboardInterrupt
+            return real_wait(timeout=timeout)
+        with unittest.mock.patch.object(hub.proc, "wait", interrupted):
+            hub.stop()
+        real_wait(timeout=2)
+        self.assertIsNotNone(hub.proc.poll())
+
+    def test_mjpeg_viewer_leaving_is_noticed_without_frames(self):
+        hub = switchdisplay.Hub([])
+        server = ThreadingHTTPServer(("127.0.0.1", 0),
+                                     switchdisplay.make_handler(hub, None, {"127.0.0.1"}))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            sock = socket.create_connection(("127.0.0.1", server.server_port))
+            sock.sendall(b"GET /mjpeg HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            sock.recv(4096)
+            deadline = time.monotonic() + 2  # headers go out just before the viewer registers
+            while not hub.clients and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(hub.clients), 1)
+            sock.close()
+            deadline = time.monotonic() + 5
+            while hub.clients and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.assertEqual(len(hub.clients), 0)
+        finally:
+            server.shutdown(); server.server_close()
 
     def test_host_validation(self):
         hub = switchdisplay.Hub([])

@@ -98,7 +98,9 @@ server — use it to confirm the capture line before running.
 
 ### Streaming efficiency profiles
 
-Use `--profile sharp|balanced|low` for 1280×720, 960×540, or 800×450. The
+Use `--profile sharp|balanced|low` for 1280×720, 960×540, or 800×450, or
+`--profile text` for readable words: sized for the Switch viewer, with better
+scaling, light sharpening and quality 85, at about twice the data per frame. The
 default remains each preset's existing size; explicit `--width`/`--height`
 always override a profile. Presets use JPEG `yuvj420p` with optimal Huffman
 tables and a `fast_bilinear` scaler (where scaling is present). On the local
@@ -116,6 +118,9 @@ The viewer supports `?mode=canvas` (default WebSocket canvas), `?mode=img`
 (client-pull WebSocket flow control). For example:
 `http://host:8090/?mode=img` and `http://host:8090/?mode=pull`. The HUD shows
 the selected mode and measured render fps for A/B comparisons on the Switch.
+
+`--fill fit|crop|stretch` sets how a picture that isn't 16:9 fills the screen, and
+the viewer's **fill** button switches live (see MAC-SETUP.md).
 
 Endpoints: `/` viewer page, `/ws` binary JPEG WebSocket, `/mjpeg` MJPEG
 fallback, `POST /click` (tap-to-click), `/input` (Joy-Con/touch keys, with

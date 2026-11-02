@@ -53,7 +53,9 @@ VIEWER_HTML = b"""<!doctype html>
 <style>
  html,body{margin:0;padding:0;background:#000;height:100%;overflow:hidden;
    -webkit-tap-highlight-color:rgba(0,0,0,0)}
- #wrap{position:fixed;top:0;left:0;right:0;bottom:0;display:block;background:#000}
+ #wrap{position:fixed;top:0;left:0;right:0;bottom:0;display:block;background:#000;overflow:hidden}
+ #fill{position:fixed;right:144px;top:6px;z-index:3;font:14px monospace;color:#8f8;
+   background:rgba(0,0,0,.45);border:1px solid #4a4;border-radius:4px;padding:2px 8px}
  canvas,img{position:absolute;left:0;top:0;background:#000}
  #hud{position:fixed;left:6px;top:6px;font:12px monospace;color:#8f8;opacity:.6;z-index:3}
  #fs{position:fixed;right:6px;top:6px;z-index:3;font:14px monospace;color:#8f8;
@@ -63,6 +65,9 @@ VIEWER_HTML = b"""<!doctype html>
  #padbtn{position:fixed;right:48px;top:6px;z-index:3;font:14px monospace;color:#8f8;display:none;
    background:rgba(0,0,0,.45);border:1px solid #4a4;border-radius:4px;padding:2px 8px}
  #pad{display:none}
+ #ptr{display:none;position:fixed;width:26px;height:26px;margin:-15px 0 0 -15px;border-radius:15px;
+   border:2px solid #000;background:rgba(255,230,0,.35);box-shadow:0 0 0 2px #ff0;
+   pointer-events:none;z-index:2}
  #kbd{position:fixed;right:96px;top:6px;z-index:3;font:14px monospace;color:#8f8;display:none;
    background:rgba(0,0,0,.45);border:1px solid #4a4;border-radius:4px;padding:2px 8px}
  #kbbar{display:none;position:fixed;left:8%;right:8%;top:36px;z-index:4;padding:8px;
@@ -83,6 +88,8 @@ VIEWER_HTML = b"""<!doctype html>
 <div id="hud">connecting...</div>
 <div id="fs" class="ui">&#9974;</div>
 <div id="padbtn" class="ui">pad</div>
+<div id="ptr"></div>
+<div id="fill" class="ui">fit</div>
 <div id="kbd" class="ui">kbd</div>
 <form id="kbbar" class="ui" action="#"><input id="kbin" class="ui" type="text"
  autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
@@ -101,6 +108,7 @@ VIEWER_HTML = b"""<!doctype html>
   var CLICK_SECRET = __CLICK_SECRET__;
   var INPUT_ON = __INPUT_ON__;
   var TEXT_ON = __TEXT_ON__;
+  var fill = __FILL__;
   var hud = document.getElementById('hud');
   var canvas = document.getElementById('c');
   var ctx = canvas.getContext('2d');
@@ -120,14 +128,29 @@ VIEWER_HTML = b"""<!doctype html>
     var vw = window.innerWidth, vh = window.innerHeight;
     var sw = mediaEl.naturalWidth || mediaEl.width || 16, sh = mediaEl.naturalHeight || mediaEl.height || 9;
     if (!sw || !sh) return;
-    var scale = Math.min(vw / sw, vh / sh);
-    var w = Math.round(sw * scale), h = Math.round(sh * scale);
+    // fit shows it all with bars; crop overflows #wrap; stretch ignores the shape.
+    // Taps map through the element's box, so they stay accurate in every mode.
+    var scale = fill === 'crop' ? Math.max(vw / sw, vh / sh) : Math.min(vw / sw, vh / sh);
+    var w = fill === 'stretch' ? vw : Math.round(sw * scale);
+    var h = fill === 'stretch' ? vh : Math.round(sh * scale);
     mediaEl.style.width = w + 'px';
     mediaEl.style.height = h + 'px';
     mediaEl.style.left = Math.round((vw - w) / 2) + 'px';
     mediaEl.style.top = Math.round((vh - h) / 2) + 'px';
   }
   window.addEventListener('resize', fit, false);
+  var fillBtn = document.getElementById('fill');
+  var cycleFill = function (ev) {
+    ev.stopPropagation(); if (ev.preventDefault) { ev.preventDefault(); }
+    fill = fill === 'fit' ? 'crop' : fill === 'crop' ? 'stretch' : 'fit';
+    fillBtn.textContent = fill;
+    window.__fill = fill;
+    fit();
+  };
+  fillBtn.textContent = fill;
+  window.__fill = fill;
+  fillBtn.addEventListener('click', cycleFill, false);
+  fillBtn.addEventListener('touchend', cycleFill, false);
 
   function hudUpdate() {
     var now = new Date().getTime();
@@ -381,6 +404,8 @@ VIEWER_HTML = b"""<!doctype html>
       var name, pads, i, n = 0;
       if (!inReady) { return; }
       for (name in held) { if (held.hasOwnProperty(name) && anyHeld(name)) { inWs.send('d:' + name); } }
+      probe['viewport-w'] = window.innerWidth;
+      probe['viewport-h'] = window.innerHeight;
       if (gpApi) {
         pads = navigator.getGamepads ? navigator.getGamepads() : navigator.webkitGetGamepads();
         for (i = 0; pads && i < pads.length; i++) { if (pads[i]) { n++; } }
@@ -391,6 +416,20 @@ VIEWER_HTML = b"""<!doctype html>
         inWs.send('p:' + name + '=' + probe[name]);
       } }
     }, 500);
+    // The Mac's arrow is a few pixels tall here and games may hide it, so mark where
+    // the right stick put the pointer. Fades when the stick rests.
+    var ptr = document.getElementById('ptr'), ptrTimer = null;
+    var showPointer = function (pos) {
+      var c = pos.split(','), r = mediaEl && mediaEl.getBoundingClientRect();
+      if (!r || !r.width) { return; }
+      // a pointer in cropped-off area sticks to the screen edge rather than vanishing
+      ptr.style.left = Math.max(0, Math.min(window.innerWidth, r.left + c[0] * r.width)) + 'px';
+      ptr.style.top = Math.max(0, Math.min(window.innerHeight, r.top + c[1] * r.height)) + 'px';
+      ptr.style.display = 'block';
+      window.__ptr = pos;
+      window.clearTimeout(ptrTimer);
+      ptrTimer = window.setTimeout(function () { ptr.style.display = 'none'; }, 2500);
+    };
     var inputConnect = function () {
       try { inWs = new WebSocket(wsBase + '/input'); } catch (e) { inState = 'keys: no ws'; return; }
       inWs.onopen = function () { inWs.send('auth:' + CLICK_SECRET); };
@@ -398,6 +437,7 @@ VIEWER_HTML = b"""<!doctype html>
         var t = String(ev.data);
         if (t === 'ok') { inReady = true; inState = 'keys'; return; }
         if (t === 'kb') { openKb(); return; }
+        if (t.indexOf('c:') === 0) { showPointer(t.substring(2)); return; }
         if (t.indexOf('err:') === 0) { tapError = t.substring(4); }
       };
       inWs.onclose = function () {
@@ -587,7 +627,7 @@ VIEWER_HTML = b"""<!doctype html>
 
 
 def render_viewer(click_enabled: bool, secret: str, input_enabled: bool = False,
-                  text_enabled: bool = False) -> bytes:
+                  text_enabled: bool = False, fill: str = "fit") -> bytes:
     """Inject the click/input flags and secret into the static page (JS literals, JSON-escaped)."""
     literal = json.dumps(secret if click_enabled or input_enabled else "")
     literal = (literal.replace("<", "\\u003c").replace(">", "\\u003e")
@@ -596,6 +636,7 @@ def render_viewer(click_enabled: bool, secret: str, input_enabled: bool = False,
             .replace(b"__CLICK_ON__", b"true" if click_enabled else b"false")
             .replace(b"__INPUT_ON__", b"true" if input_enabled else b"false")
             .replace(b"__TEXT_ON__", b"true" if input_enabled and text_enabled else b"false")
+            .replace(b"__FILL__", json.dumps(fill).encode())
             .replace(b"__CLICK_SECRET__", literal.encode()))
 
 
@@ -840,8 +881,8 @@ def quartz_mouse_button(button: int, down: bool) -> None:
 
 
 def quartz_mouse_move(dx: int, dy: int, bounds: tuple[int, int, int, int] | None,
-                      kind: int, button: int) -> None:
-    """Move the pointer by (dx, dy), staying inside bounds (x, y, width, height)."""
+                      kind: int, button: int) -> tuple[float, float]:
+    """Move the pointer by (dx, dy), staying inside bounds; returns where it ended up."""
     q = _coregraphics()
     if q is None:
         raise OSError("CoreGraphics unavailable")
@@ -858,6 +899,7 @@ def quartz_mouse_move(dx: int, dy: int, bounds: tuple[int, int, int, int] | None
     q.cg.CGEventSetIntegerValueField(event, 5, dy)  # kCGMouseEventDeltaY
     q.cg.CGEventPost(0, event)
     q.cf.CFRelease(event)
+    return x, y
 
 
 MAX_TEXT = 1000  # characters per Switch keyboard submission
@@ -991,6 +1033,7 @@ class KeyInjector:
         self.button_poster = button_poster or quartz_mouse_button
         self.mover = mover or quartz_mouse_move
         self.bounds = bounds
+        self.last_pointer: tuple[float, float] | None = None
         self.text_enabled = text_enabled
         self.text_poster = text_poster or quartz_text
         self.focus_check = focus_check or focused_text_field
@@ -1073,6 +1116,11 @@ class KeyInjector:
         with self._lock:
             self.stats["moves"] += 1
             if self.dry_run:
+                if self.bounds:  # a pretend pointer, so the viewer's marker can be tried safely
+                    bx, by, bw, bh = self.bounds
+                    x, y = self.last_pointer or (bx + bw / 2, by + bh / 2)
+                    self.last_pointer = (min(max(x + dx, bx), bx + bw - 1),
+                                         min(max(y + dy, by), by + bh - 1))
                 return None
             if accessibility_trusted() is False:
                 self.stats["failed"] += 1
@@ -1085,10 +1133,18 @@ class KeyInjector:
             else:
                 kind, button = 5, 0
             try:
-                self.mover(dx, dy, self.bounds, kind, button)
+                self.last_pointer = self.mover(dx, dy, self.bounds, kind, button)
             except OSError:
                 self.stats["failed"] += 1
         return None
+
+    def pointer_message(self) -> bytes | None:
+        """Where the pointer is on the captured screen, as 'c:<0..1>,<0..1>' for the viewer."""
+        if not self.bounds or not self.last_pointer:
+            return None
+        bx, by, bw, bh = self.bounds
+        x, y = self.last_pointer
+        return b"c:%.4f,%.4f" % ((x - bx) / bw, (y - by) / bh)
 
     def press(self, conn, name: str, down: bool) -> str | None:
         """Apply one input event; returns an error for the viewer, or None."""
@@ -1326,12 +1382,23 @@ class Hub:
         self.stderr_tail: list[str] = []
         self.started = time.time()
         self.frame_id = 0
+        self.no_frames_warn_s = 8.0
 
     def start(self) -> None:
-        self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     start_new_session=True)
+        # stdin must not be the terminal: ffmpeg treats keys as commands, and once the
+        # terminal is gone it can spin at full CPU instead of exiting, holding the capture.
+        self.proc = subprocess.Popen(self.cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, start_new_session=True)
         threading.Thread(target=self._read_frames, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
+        threading.Thread(target=self._warn_if_no_frames, daemon=True).start()
+
+    def _warn_if_no_frames(self) -> None:
+        time.sleep(self.no_frames_warn_s)
+        if not self.frames and self.proc and self.proc.poll() is None:
+            print(f"[src ] WARNING: no frames after {self.no_frames_warn_s:g} s, so the viewer "
+                  "will stay black. A stuck capture from an earlier run is the usual cause: "
+                  "stop this server, run pkill -f avfoundation, then start it again.", flush=True)
 
     def _read_stderr(self) -> None:
         assert self.proc and self.proc.stderr
@@ -1392,7 +1459,8 @@ class Hub:
                 self.proc.terminate()
             try:
                 self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                # a second Ctrl-C while waiting must not leave the capture running
                 try:
                     os.killpg(self.proc.pid, signal.SIGKILL)
                 except OSError:
@@ -1568,7 +1636,7 @@ class WSClientParser:
 def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                  allowed_hosts: set[str] | None = None,
                  click_allow: set[str] | None = None,
-                 injector: "KeyInjector | None" = None):
+                 injector: "KeyInjector | None" = None, fill: str = "fit"):
     from http.server import BaseHTTPRequestHandler
 
     class Handler(BaseHTTPRequestHandler):
@@ -1652,7 +1720,8 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 allowed = clicker is not None and self._click_client_ok()
                 page = render_viewer(allowed, clicker.secret if clicker else "",
                                      allowed and injector is not None,
-                                     allowed and injector is not None and injector.text_enabled)
+                                     allowed and injector is not None and injector.text_enabled,
+                                     fill)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(page)))
@@ -1695,6 +1764,10 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                             with hub.lock:
                                 frame = hub.latest
                             if frame is None:
+                                # nothing to write means a gone viewer goes unnoticed
+                                readable, _, _ = select.select([self.connection], [], [], 0)
+                                if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                                    break
                                 continue
                         self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
                         self.wfile.write(b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n")
@@ -1831,6 +1904,8 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                                 continue
                             if err:
                                 send(b"err:" + err.encode())
+                            elif injector.pointer_message():
+                                send(injector.pointer_message())
                         elif text.startswith("t:"):
                             err = injector.type_text(text[2:])
                             if err:
@@ -1898,6 +1973,18 @@ def _qv(quality: int) -> int:
     return max(1, min(31, 31 - int(quality * 0.31)))
 
 
+def _scale_filter(width: int, height: int, static: bool, sharp: bool,
+                  stretch: bool = False) -> str:
+    """Scale to fit. sharp costs some CPU and data but keeps small text readable.
+
+    stretch fills width x height exactly, so the viewer needn't enlarge the frame again.
+    """
+    flags, extra = ("lanczos", ",unsharp=3:3:0.5") if sharp else ("fast_bilinear", "")
+    shape = "" if stretch else "force_original_aspect_ratio=decrease:force_divisible_by=2:"
+    return (f"scale={width}:{height}:{shape}flags={flags}{extra}" +
+            (",mpdecimate,setpts=N/FRAME_RATE/TB" if static else ""))
+
+
 def default_capture_cmd(width: int, height: int, fps: int, quality: int,
                         static: bool = False) -> list[str]:
     vf = "mpdecimate,setpts=N/FRAME_RATE/TB" if static else None
@@ -1911,7 +1998,7 @@ def default_capture_cmd(width: int, height: int, fps: int, quality: int,
 
 
 def mac_capture_cmd(index: int, width: int, height: int, fps: int, quality: int,
-                    static: bool = False) -> list[str]:
+                    static: bool = False, sharp: bool = False, stretch: bool = False) -> list[str]:
     """macOS: AVFoundation screen device -> MJPEG on stdout.
 
     `index` is an AVFoundation video device: a name such as "Capture screen 0"
@@ -1925,9 +2012,7 @@ def mac_capture_cmd(index: int, width: int, height: int, fps: int, quality: int,
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "avfoundation", "-framerate", str(fps), "-pixel_format", "nv12",
         "-capture_cursor", "1", "-i", f"{index}:none",
-        "-vf", (f"scale={width}:{height}:force_original_aspect_ratio=decrease:"
-                f"force_divisible_by=2:flags=fast_bilinear" +
-                (",mpdecimate,setpts=N/FRAME_RATE/TB" if static else "")),
+        "-vf", _scale_filter(width, height, static, sharp, stretch),
         # passthrough: the default CFR mode duplicates AVFoundation frames to
         # hundreds of fps (measured ~680 fps for -framerate 15), flooding Wi-Fi
         "-fps_mode", "passthrough",
@@ -1937,13 +2022,11 @@ def mac_capture_cmd(index: int, width: int, height: int, fps: int, quality: int,
 
 
 def x11_capture_cmd(display: str, width: int, height: int, fps: int, quality: int,
-                    static: bool = False) -> list[str]:
+                    static: bool = False, sharp: bool = False, stretch: bool = False) -> list[str]:
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "x11grab", "-framerate", str(fps), "-i", display,
-        "-vf", (f"scale={width}:{height}:force_original_aspect_ratio=decrease:"
-                f"force_divisible_by=2:flags=fast_bilinear" +
-                (",mpdecimate,setpts=N/FRAME_RATE/TB" if static else "")),
+        "-vf", _scale_filter(width, height, static, sharp, stretch),
         "-pix_fmt", "yuvj420p", "-huffman", "optimal",
         "-c:v", "mjpeg", "-q:v", str(_qv(quality)), "-f", "mjpeg", "-",
     ]
@@ -1956,7 +2039,10 @@ PRESETS = {
     "mac-extended": (1280, 720, 15),
     "x11": (960, 540, 20),
 }
-PROFILES = {"sharp": (1280, 720), "balanced": (960, 540), "low": (800, 450)}
+# text is sized to the Switch viewer's 1280x648 (the footer takes the rest), so the
+# browser draws frames close to 1:1 instead of blurring them with a second scale.
+PROFILES = {"sharp": (1280, 720), "balanced": (960, 540), "low": (800, 450),
+            "text": (1280, 648)}
 
 
 def resolve_capture(args) -> list[str]:
@@ -1973,9 +2059,13 @@ def resolve_capture(args) -> list[str]:
     if preset == "test":
         return default_capture_cmd(args.width, args.height, args.fps, quality, getattr(args, "static", False))
     if preset in ("mac-mirror", "mac-extended"):
-        return mac_capture_cmd(_mac_device(args), args.width, args.height, args.fps, quality, getattr(args, "static", False))
+        return mac_capture_cmd(_mac_device(args), args.width, args.height, args.fps, quality,
+                               getattr(args, "static", False), getattr(args, "profile", None) == "text",
+                               getattr(args, "fill", "fit") == "stretch")
     if preset == "x11":
-        return x11_capture_cmd(args.display, args.width, args.height, args.fps, quality, getattr(args, "static", False))
+        return x11_capture_cmd(args.display, args.width, args.height, args.fps, quality,
+                               getattr(args, "static", False), getattr(args, "profile", None) == "text",
+                               getattr(args, "fill", "fit") == "stretch")
     raise SystemExit(f"unknown preset: {preset}")
 
 
@@ -2036,8 +2126,10 @@ def main() -> int:
     ap.add_argument("--bind", default="0.0.0.0", help="HTTP bind address")
     ap.add_argument("--preset", choices=sorted(PRESETS), default=None,
                      help="capture preset: test | mac-mirror | mac-extended | x11 (default test)")
-    ap.add_argument("--profile", choices=("sharp", "balanced", "low"), default=None,
-                     help="size profile: sharp 1280x720, balanced 960x540, low 800x450")
+    ap.add_argument("--profile", choices=sorted(PROFILES), default=None,
+                     help="size profile: sharp 1280x720, balanced 960x540, low 800x450, or text: "
+                          "sized for the Switch viewer with better scaling and quality 85, "
+                          "for readable words at some cost in frame rate")
     ap.add_argument("--source", default=None,
                     help="explicit capture command writing JPEG to stdout; placeholders "
                          "{w} {h} {fps} {q} (1..100) {qv} (ffmpeg -q:v 1..31)")
@@ -2053,7 +2145,12 @@ def main() -> int:
     ap.add_argument("--width", type=int, default=None)
     ap.add_argument("--height", type=int, default=None)
     ap.add_argument("--fps", type=int, default=None)
-    ap.add_argument("--quality", type=int, default=65, help="1..100 (default 65)")
+    ap.add_argument("--quality", type=int, default=None,
+                    help="1..100 (default 65, or 85 with --profile text)")
+    ap.add_argument("--fill", choices=("fit", "crop", "stretch"), default="fit",
+                    help="how the picture fills the Switch screen: fit keeps it all with black "
+                         "bars, crop cuts the overflow, stretch changes its shape (default fit; "
+                         "the viewer's fill button switches live)")
     ap.add_argument("--static", action="store_true",
                     help="drop unchanged frames with mpdecimate (preset capture only)")
     ap.add_argument("--dns-port", type=int, default=0,
@@ -2098,6 +2195,10 @@ def main() -> int:
     pw, ph, pf = PRESETS[args.preset or "test"]
     if args.profile:
         pw, ph = PROFILES[args.profile]
+    if args.profile == "text" and args.fill == "crop":
+        ph = 830  # crop draws the full width, so frames need the width, not the height
+    if args.quality is None:
+        args.quality = 85 if args.profile == "text" else 65
     if args.width is None:
         args.width = pw
     if args.height is None:
@@ -2164,7 +2265,7 @@ def main() -> int:
     hub = Hub(cmd)
     server = LocalThreadingHTTPServer((args.bind, args.port),
                                  make_handler(hub, clicker, allowed_hosts, set(args.click_allow),
-                                              injector))
+                                              injector, args.fill))
     server.daemon_threads = True
     if os.geteuid() == 0 and os.environ.get("SUDO_UID"):
         uid, gid = int(os.environ["SUDO_UID"]), int(os.environ.get("SUDO_GID", "0"))
