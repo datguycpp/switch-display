@@ -353,6 +353,7 @@ good and the problem is the Switch's DNS/applet step.
 | Symptom | Cause / fix |
 |---|---|
 | Frames are black | Screen Recording permission missing for the terminal → grant, **restart the terminal** |
+| Viewer stays black, `/health` `frames` stays 0, server warns `no frames` | A stuck capture from an earlier run. Check with `pgrep -fl avfoundation`, stop it with `pkill -f avfoundation`, then restart the server. Also check that the display is awake |
 | `Address already in use` on port 53 or 80 | mDNSResponder/another resolver holds it. Bind another interface/service, or use 5353/8090 and pf redirects. DNS example: `rdr on en0 inet proto udp from any to any port 53 -> <mac-lan-ip> port 5353` HTTP example: `rdr on en0 inet proto tcp from any to any port 80 -> <mac-lan-ip> port 8090` (also add matching `nat`/`pass` rules; `sudo pfctl -f <file> -e`) |
 | Switch shows "Could not connect" | Mac firewall blocked `python3`, or the router has client isolation, or Mac and Switch are on different subnets/SSIDs |
 | Stream works on the phone but not the Switch | re-check primary DNS is exactly `<mac-lan-ip>`, secondary `8.8.8.8`, and that the applet (not a normal page) is what opened |

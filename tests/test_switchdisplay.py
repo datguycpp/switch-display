@@ -8,6 +8,7 @@ import time
 import unittest
 import unittest.mock
 import struct
+import subprocess
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 
@@ -421,6 +422,61 @@ class Tests(unittest.TestCase):
         finally:
             server.close()
             reader.close()
+
+    def test_capture_never_reads_the_terminal_and_warns_without_frames(self):
+        hub = switchdisplay.Hub(["sleep", "2"])
+        hub.no_frames_warn_s = 0.05
+        with unittest.mock.patch("builtins.print") as printed:
+            hub.start()
+            try:
+                self.assertEqual(hub.proc.stdin, None)
+                # no reader threads: they would spin forever on a fake process's output
+                with unittest.mock.patch("subprocess.Popen") as popen, \
+                        unittest.mock.patch.object(switchdisplay.threading, "Thread"):
+                    switchdisplay.Hub(["x"]).start()
+                self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+                time.sleep(0.3)
+            finally:
+                hub.stop()
+        self.assertIn("no frames", " ".join(str(c.args[0]) for c in printed.call_args_list))
+
+    def test_second_interrupt_while_stopping_still_kills_capture(self):
+        hub = switchdisplay.Hub(["sleep", "30"])
+        hub.no_frames_warn_s = 30
+        hub.start()
+        real_wait = hub.proc.wait
+        calls = []
+
+        def interrupted(timeout=None):
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise KeyboardInterrupt
+            return real_wait(timeout=timeout)
+        with unittest.mock.patch.object(hub.proc, "wait", interrupted):
+            hub.stop()
+        real_wait(timeout=2)
+        self.assertIsNotNone(hub.proc.poll())
+
+    def test_mjpeg_viewer_leaving_is_noticed_without_frames(self):
+        hub = switchdisplay.Hub([])
+        server = ThreadingHTTPServer(("127.0.0.1", 0),
+                                     switchdisplay.make_handler(hub, None, {"127.0.0.1"}))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            sock = socket.create_connection(("127.0.0.1", server.server_port))
+            sock.sendall(b"GET /mjpeg HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            sock.recv(4096)
+            deadline = time.monotonic() + 2  # headers go out just before the viewer registers
+            while not hub.clients and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(hub.clients), 1)
+            sock.close()
+            deadline = time.monotonic() + 5
+            while hub.clients and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.assertEqual(len(hub.clients), 0)
+        finally:
+            server.shutdown(); server.server_close()
 
     def test_host_validation(self):
         hub = switchdisplay.Hub([])

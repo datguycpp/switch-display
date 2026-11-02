@@ -1382,12 +1382,23 @@ class Hub:
         self.stderr_tail: list[str] = []
         self.started = time.time()
         self.frame_id = 0
+        self.no_frames_warn_s = 8.0
 
     def start(self) -> None:
-        self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     start_new_session=True)
+        # stdin must not be the terminal: ffmpeg treats keys as commands, and once the
+        # terminal is gone it can spin at full CPU instead of exiting, holding the capture.
+        self.proc = subprocess.Popen(self.cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, start_new_session=True)
         threading.Thread(target=self._read_frames, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
+        threading.Thread(target=self._warn_if_no_frames, daemon=True).start()
+
+    def _warn_if_no_frames(self) -> None:
+        time.sleep(self.no_frames_warn_s)
+        if not self.frames and self.proc and self.proc.poll() is None:
+            print(f"[src ] WARNING: no frames after {self.no_frames_warn_s:g} s, so the viewer "
+                  "will stay black. A stuck capture from an earlier run is the usual cause: "
+                  "stop this server, run pkill -f avfoundation, then start it again.", flush=True)
 
     def _read_stderr(self) -> None:
         assert self.proc and self.proc.stderr
@@ -1448,7 +1459,8 @@ class Hub:
                 self.proc.terminate()
             try:
                 self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                # a second Ctrl-C while waiting must not leave the capture running
                 try:
                     os.killpg(self.proc.pid, signal.SIGKILL)
                 except OSError:
@@ -1752,6 +1764,10 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                             with hub.lock:
                                 frame = hub.latest
                             if frame is None:
+                                # nothing to write means a gone viewer goes unnoticed
+                                readable, _, _ = select.select([self.connection], [], [], 0)
+                                if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                                    break
                                 continue
                         self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
                         self.wfile.write(b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n")
