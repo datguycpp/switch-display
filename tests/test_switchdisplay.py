@@ -1,6 +1,7 @@
 import http.client
 import inspect
 import json
+import re
 import select
 import socket
 import threading
@@ -503,6 +504,162 @@ class Tests(unittest.TestCase):
         self.assertIn("192.0.2.9", hosts)
         self.assertNotIn("0.0.0.0", hosts)
         self.assertNotIn("::", switchdisplay._allowed_hosts("::", "192.0.2.9", []))
+
+
+    def test_control_locks_to_first_remote_viewer(self):
+        with unittest.mock.patch("builtins.print"):
+            gate = switchdisplay.ControlGate(local={"192.0.2.1"})
+            self.assertFalse(gate.ok("192.0.2.50"))        # nobody has opened the viewer yet
+            self.assertTrue(gate.claim("192.0.2.1"))       # the Mac itself: allowed, no lock taken
+            self.assertIsNone(gate.owner)
+            self.assertTrue(gate.claim("192.0.2.50"))      # first remote device takes it
+            self.assertFalse(gate.claim("192.0.2.66"))     # a later one is view-only
+            self.assertFalse(gate.ok("192.0.2.66"))
+            self.assertTrue(gate.ok("192.0.2.50") and gate.ok("127.0.0.1"))
+            self.assertEqual(gate.snapshot()["refused"], ["192.0.2.66"])
+            strict = switchdisplay.ControlGate({"192.0.2.7"}, local={"192.0.2.1"})
+            self.assertTrue(strict.claim("192.0.2.7"))
+            self.assertFalse(strict.claim("192.0.2.50") or strict.ok("192.0.2.1"))
+            self.assertIsNone(strict.owner)
+
+    def test_view_only_client_gets_no_secret_and_cannot_click(self):
+        gate = switchdisplay.ControlGate()
+        gate.local, gate.owner = set(), "192.0.2.50"       # someone else holds control
+        clicker = switchdisplay.Clicker("sekrit", None, (0, 0), True)
+        inj = switchdisplay.KeyInjector({}, dry_run=True)
+        hub = switchdisplay.Hub([])
+        server = ThreadingHTTPServer(("127.0.0.1", 0), switchdisplay.make_handler(
+            hub, clicker, {"127.0.0.1"}, set(), inj, gate=gate))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        def request(method, path, body=None):
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port)
+            conn.request(method, path, body=body)
+            response = conn.getresponse()
+            data = response.read()
+            conn.close()
+            return response.status, data
+        try:
+            with unittest.mock.patch("builtins.print"):
+                status, page = request("GET", "/")
+                self.assertEqual(status, 200)
+                self.assertNotIn(b"sekrit", page)
+                self.assertIn(b"var CLICK_ON = false;", page)
+                click = json.dumps({"x": 1, "y": 1, "secret": "sekrit"})
+                self.assertEqual(request("POST", "/click", click)[0], 403)
+                self.assertEqual(request("GET", "/input")[0], 403)
+                self.assertEqual(clicker.stats["received"], 0)
+                gate.owner = "127.0.0.1"
+                self.assertIn(b"sekrit", request("GET", "/")[1])
+                health = json.loads(request("GET", "/health")[1])
+                self.assertEqual(health["control"]["owner"], "127.0.0.1")
+        finally:
+            server.shutdown(); server.server_close(); inj.close()
+
+    def test_rate_limit_is_per_client(self):
+        c = switchdisplay.Clicker("s", None, (0, 0), True, min_gap_s=60)
+        self.assertEqual(c.click("a", 1, 1, (2, 2))[0], 200)
+        self.assertEqual(c.click("a", 1, 1, (2, 2))[0], 429)
+        c.reject("noisy")                                  # another device failing auth
+        self.assertEqual(c.click("b", 1, 1, (2, 2))[0], 200)
+
+    def test_duplicate_frames_are_skipped_and_new_viewers_get_the_current_one(self):
+        hub = switchdisplay.Hub([])
+        frame = lambda tag: b"\xff\xd8" + tag * 64 + b"\xff\xd9"
+        first = hub.add_client()
+        try:
+            hub._publish(frame(b"a"))
+            first.queue.get_nowait(); first.drain_wakeup()
+            hub._publish(frame(b"a"))                      # unchanged screen
+            self.assertTrue(first.queue.empty())
+            self.assertEqual((hub.frames, hub.duplicates, hub.frame_id), (2, 1, 1))
+            late = hub.add_client("192.0.2.50")            # must not wait for the next change
+            try:
+                self.assertEqual(late.queue.get_nowait(), frame(b"a"))
+                self.assertTrue(select.select([late.wakeup_fd], [], [], 0)[0])
+            finally:
+                hub.remove_client(late)
+            hub._publish(frame(b"b"))
+            self.assertEqual(first.queue.get_nowait(), frame(b"b"))
+        finally:
+            hub.remove_client(first)
+
+    def test_viewer_reports_show_up_per_client(self):
+        client = switchdisplay.Client("192.0.2.50")
+        try:
+            client.count(b"x" * 2048); client.count(b"x" * 2048)
+            for bad in ("nan,canvas", "9999,canvas", "abc", ""):
+                client.report(bad)
+            self.assertIsNone(client.render_fps)
+            client.report("11.5,img")
+            client.report("7.0,<script>")                  # mode outside the known set is ignored
+            snap = client.snapshot()
+            self.assertEqual((snap["render_fps"], snap["mode"], snap["sent"], snap["kb_per_frame"]),
+                             (7.0, "img", 2, 2.0))
+        finally:
+            client.close()
+
+    def _wait(self, condition, seconds=4.0):
+        deadline = time.monotonic() + seconds
+        while not condition() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return condition()
+
+    def test_capture_restarts_after_it_exits(self):
+        hub = switchdisplay.Hub(["sh", "-c", "sleep 0.1; exit 3"])
+        with unittest.mock.patch("builtins.print") as printed:
+            hub.start()
+            try:
+                self.assertTrue(self._wait(lambda: hub.restarts >= 1))
+            finally:
+                hub.stop()
+        self.assertIn("capture exited (3)", " ".join(str(c.args[0]) for c in printed.call_args_list))
+        once = switchdisplay.Hub(["sh", "-c", "exit 0"], restart=False)
+        with unittest.mock.patch("builtins.print"):
+            once.start()
+            try:
+                self._wait(lambda: once.proc.poll() is not None)
+                time.sleep(0.6)
+                self.assertEqual(once.restarts, 0)
+            finally:
+                once.stop()
+
+    def test_capture_without_frames_is_restarted_when_asked(self):
+        hub = switchdisplay.Hub(["sleep", "30"], restart_stalled=True)
+        hub.no_frames_warn_s = 0.05
+        with unittest.mock.patch("builtins.print"):
+            hub.start()
+            first = hub.proc
+            try:
+                self.assertTrue(self._wait(lambda: hub.restarts >= 1))
+                self.assertIsNotNone(first.poll())         # the stuck one was killed
+                self.assertIsNot(hub.proc, first)
+            finally:
+                hub.stop()
+        self.assertTrue(self._wait(lambda: hub.proc.poll() is not None))
+
+    def test_capture_that_stops_sending_frames_is_restarted(self):
+        jpeg = "\\377\\330" + "x" * 64 + "\\377\\331"
+        hub = switchdisplay.Hub(["sh", "-c", f"printf '{jpeg}'; sleep 30"], stall_s=0.2)
+        with unittest.mock.patch("builtins.print"):
+            hub.start()
+            try:
+                self.assertTrue(self._wait(lambda: hub.frames >= 1))
+                self.assertTrue(self._wait(lambda: hub.restarts >= 1))
+            finally:
+                hub.stop()
+
+    def test_viewer_script_stays_es5(self):
+        # the Switch's WebKit 601-class engine stops at the first ES6 token
+        page = switchdisplay.render_viewer(True, "s", True, True).decode()
+        script = page[page.index("<script>") + 8:page.index("</script>")]
+        code = "\n".join(line.split("//")[0] for line in script.splitlines())
+        for name, pattern in (("arrow function", r"=>"), ("let/const", r"\b(let|const)\s+[\w$\[{]"),
+                              ("template literal", r"`"), ("class", r"\bclass\s+\w"),
+                              ("async/await", r"\b(async|await)\b"), ("spread", r"\.\.\.\s*[\w$\[]"),
+                              ("fetch", r"\bfetch\s*\("), ("for-of", r"\bfor\s*\([^)]*\bof\b"),
+                              ("Promise", r"\bPromise\b")):
+            self.assertIsNone(re.search(pattern, code), f"ES6 {name} in the viewer script")
 
 
 if __name__ == "__main__":

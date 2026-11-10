@@ -159,7 +159,13 @@ VIEWER_HTML = b"""<!doctype html>
       (CLICK_ON ? ' \\u00b7 taps ' + taps : ' \\u00b7 view only') +
       (INPUT_ON ? ' \\u00b7 ' + inState + ' ' + (lastInput || '-') + (gpApi ? ' gp' : '') : '') +
       (tapError ? ' \\u00b7 ' + tapError : '');
-    if (now - last > 2000) { frames = 0; last = now; }
+    if (now - last > 2000) {
+      // tell the server what this screen really draws, for /health "viewers"
+      if (window.__ws && window.__ws.readyState === 1) {
+        window.__ws.send('f:' + fps.toFixed(1) + ',' + window.__mode);
+      }
+      frames = 0; last = now;
+    }
   }
   window.setInterval(hudUpdate, 500);
 
@@ -190,7 +196,7 @@ VIEWER_HTML = b"""<!doctype html>
       try { ws = new WebSocket(url); } catch (e) { mjpegFallback(); return; }
        window.__mode = wantedMode === 'pull' ? 'pull' : wantedMode;
        ws.binaryType = 'arraybuffer';
-       ws.onopen = function () { hud.textContent = window.__mode + ' open';
+       ws.onopen = function () { hud.textContent = window.__mode + ' open'; window.__ws = ws;
          if (wantedMode === 'pull') ws.send('pull'); };
        ws.onmessage = function (ev) {
         if (!gotMessage) { gotMessage = true; window.__wsAttempts = 0; }
@@ -1224,6 +1230,53 @@ class KeyInjector:
                     "probe": dict(self.probe)}
 
 
+class ControlGate:
+    """Which client may control the Mac, and so be sent the secret.
+
+    The viewer page carries the secret, so whoever may load the controlling page
+    may click and type. With --click-allow only those addresses qualify. Without
+    it the first remote client to load the viewer becomes the only controller
+    until the server restarts; everyone else gets the view-only page. The Mac
+    itself (loopback or its own LAN address) may always control, without taking
+    the lock, so checking the page in a Mac browser doesn't lock the Switch out.
+    """
+
+    def __init__(self, allow=(), local=()):
+        self.allow = set(allow)
+        self.local = set(local) | {"127.0.0.1", "::1"}
+        self.owner: str | None = None
+        self.refused: set[str] = set()
+        self._lock = threading.Lock()
+
+    def claim(self, ip: str) -> bool:
+        """A viewer page load: may this client control? Takes the lock if it is free."""
+        if self.allow:
+            return ip in self.allow
+        if ip in self.local:
+            return True
+        with self._lock:
+            if self.owner is None:
+                self.owner = ip
+                print(f"[lock] control locked to {ip}, the first device to open the viewer. "
+                      "Other devices are view-only; restart the server to change it, "
+                      "or name the device with --click-allow IP.", flush=True)
+            elif ip != self.owner and ip not in self.refused and len(self.refused) < 64:
+                self.refused.add(ip)
+                print(f"[lock] {ip} opened the viewer: view-only, control belongs to "
+                      f"{self.owner}", flush=True)
+            return ip == self.owner
+
+    def ok(self, ip: str) -> bool:
+        """May this client click or send input? Never takes the lock."""
+        if self.allow:
+            return ip in self.allow
+        return ip in self.local or ip == self.owner
+
+    def snapshot(self) -> dict:
+        return {"owner": self.owner, "allow": sorted(self.allow),
+                "refused": sorted(self.refused)}
+
+
 class Clicker:
     """Tap-to-click: validate a shared secret, rate-limit, synthesise one left click.
 
@@ -1246,7 +1299,7 @@ class Clicker:
         self.last_click: dict | None = None
         self._lock = threading.Lock()
         self._by_ip: dict[str, list[float]] = {}
-        self._last_time = 0.0
+        self._last_time: dict[str, float] = {}  # per client: one device can't throttle another
 
     def check_secret(self, candidate: str) -> bool:
         return hmac.compare_digest(str(candidate).encode(), self.secret.encode())
@@ -1259,14 +1312,19 @@ class Clicker:
 
     def _rate_ok(self, ip: str) -> bool:
         now = time.monotonic()
-        if now - self._last_time < self.min_gap_s:
+        if len(self._by_ip) > 256:  # bounded: forget clients with nothing recent
+            for old in [k for k, v in self._by_ip.items()
+                        if not v or now - v[-1] >= self.window_s]:
+                self._by_ip.pop(old, None)
+                self._last_time.pop(old, None)
+        if now - self._last_time.get(ip, float("-inf")) < self.min_gap_s:
             return False
         q = self._by_ip.setdefault(ip, [])
         q[:] = [t for t in q if now - t < self.window_s]
         if len(q) >= self.max_per_window:
             return False
         q.append(now)
-        self._last_time = now
+        self._last_time[ip] = now
         return True
 
     def synthesizer(self, px: int, py: int) -> tuple[str, list[str]]:
@@ -1369,81 +1427,145 @@ def split_jpeg_stream(chunks, max_buffer: int = 8 * 1024 * 1024):
 
 
 class Hub:
-    """One capture subprocess feeding N websocket clients and the MJPEG endpoint."""
+    """One capture subprocess feeding N websocket clients and the MJPEG endpoint.
 
-    def __init__(self, cmd: list[str]):
+    A supervisor thread restarts the capture when it exits (with backoff), and,
+    when asked to, when it never produces a frame or stops producing them.
+    """
+
+    def __init__(self, cmd: list[str], restart: bool = True, restart_stalled: bool = False,
+                 stall_s: float | None = None):
         self.cmd = cmd
+        self.restart = restart                  # start it again when it exits
+        self.restart_stalled = restart_stalled  # ...and when it never sends a first frame
+        self.stall_s = stall_s                  # ...and when frames stop for this long
         self.latest: bytes | None = None
         self.frame_size: tuple[int, int] | None = None
         self.lock = threading.Lock()
         self.clients: set[Client] = set()
-        self.frames = 0
+        self.frames = 0          # frames captured
+        self.duplicates = 0      # of those, identical to the one before: not sent
+        self.restarts = 0
         self.proc: subprocess.Popen | None = None
         self.stderr_tail: list[str] = []
         self.started = time.time()
         self.frame_id = 0
         self.no_frames_warn_s = 8.0
+        self._proc_frames = 0
+        self._spawned = self._last_frame = time.monotonic()
+        self._stopping = threading.Event()
+        self._proc_lock = threading.Lock()
 
     def start(self) -> None:
-        # stdin must not be the terminal: ffmpeg treats keys as commands, and once the
-        # terminal is gone it can spin at full CPU instead of exiting, holding the capture.
-        self.proc = subprocess.Popen(self.cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, start_new_session=True)
-        threading.Thread(target=self._read_frames, daemon=True).start()
-        threading.Thread(target=self._read_stderr, daemon=True).start()
-        threading.Thread(target=self._warn_if_no_frames, daemon=True).start()
+        self._spawn()
+        threading.Thread(target=self._supervise, daemon=True).start()
 
-    def _warn_if_no_frames(self) -> None:
-        time.sleep(self.no_frames_warn_s)
-        if not self.frames and self.proc and self.proc.poll() is None:
-            print(f"[src ] WARNING: no frames after {self.no_frames_warn_s:g} s, so the viewer "
-                  "will stay black. A stuck capture from an earlier run is the usual cause: "
-                  "stop this server, run pkill -f avfoundation, then start it again.", flush=True)
+    def _spawn(self) -> None:
+        with self._proc_lock:
+            if self._stopping.is_set():
+                return
+            # stdin must not be the terminal: ffmpeg treats keys as commands, and once the
+            # terminal is gone it can spin at full CPU instead of exiting, holding the capture.
+            proc = subprocess.Popen(self.cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, start_new_session=True)
+            self.proc = proc
+            self._proc_frames = 0
+            self._spawned = self._last_frame = time.monotonic()
+        threading.Thread(target=self._read_frames, args=(proc,), daemon=True).start()
+        threading.Thread(target=self._read_stderr, args=(proc,), daemon=True).start()
 
-    def _read_stderr(self) -> None:
-        assert self.proc and self.proc.stderr
-        for line in self.proc.stderr:
+    def _supervise(self) -> None:
+        backoff, exited_at, warned = 0.5, None, False
+        while not self._stopping.wait(min(0.25, self.no_frames_warn_s)):
+            proc, now = self.proc, time.monotonic()
+            if proc is None or proc.poll() is not None:
+                if exited_at is None:
+                    exited_at = now
+                    healthy = self._proc_frames and now - self._spawned > 10
+                    backoff = 1.0 if healthy else min(backoff * 2, 15.0)
+                    code = proc.returncode if proc else None
+                    why = next((l for l in reversed(self.stderr_tail) if l), "")
+                    self.stderr_tail.append(f"capture process exited ({code})")
+                    print(f"[src ] capture exited ({code})" + (f": {why}" if why else "") +
+                          (f"; restarting in {backoff:g} s" if self.restart else ""), flush=True)
+                if not self.restart:
+                    return
+                if now - exited_at >= backoff:
+                    try:
+                        self._spawn()
+                    except OSError as exc:  # e.g. ffmpeg uninstalled meanwhile
+                        print(f"[src ] cannot start capture: {exc}", flush=True)
+                        exited_at = now
+                        continue
+                    self.restarts += 1
+                    exited_at, warned = None, False
+                continue
+            if not self._proc_frames:
+                if not warned and now - self._spawned > self.no_frames_warn_s:
+                    warned = True
+                    print(f"[src ] WARNING: no frames after {self.no_frames_warn_s:g} s, so the "
+                          "viewer will stay black" +
+                          ("; restarting the capture" if self.restart_stalled else "") +
+                          ". A stuck capture from an earlier run is the usual cause: if this "
+                          "repeats, stop this server, run pkill -f avfoundation, then start "
+                          "it again.", flush=True)
+                    if self.restart_stalled:
+                        self._terminate(proc)
+            elif self.stall_s and now - self._last_frame > self.stall_s:
+                print(f"[src ] WARNING: no frames for {self.stall_s:g} s; restarting the capture",
+                      flush=True)
+                self._last_frame = now
+                self._terminate(proc)
+
+    def _read_stderr(self, proc: subprocess.Popen) -> None:
+        for line in proc.stderr:
             self.stderr_tail.append(line.decode("utf-8", "replace").rstrip())
             del self.stderr_tail[:-20]
 
-    def _read_frames(self) -> None:
+    def _read_frames(self, proc: subprocess.Popen) -> None:
         """Split a concatenated JPEG stream at SOI/EOI markers.
 
         Bytes before the first SOI are discarded.  EOI is used so each frame is
         published immediately; an 8 MiB cap prevents a broken source growing
         memory without bound.
         """
-        assert self.proc and self.proc.stdout
         splitter = JpegStreamSplitter()
         while True:
             # read1 returns whatever is available: read(n) would block until the
             # full 64 KB fills, which throttles a 20 fps stream to a few fps
             # and makes the newest-frame-only client queue drop frames.
-            chunk = self.proc.stdout.read1(65536)
+            chunk = proc.stdout.read1(65536)
             if not chunk:
                 break
             for frame in splitter.feed(chunk):
                 self._publish(frame)
-        if self.proc and self.proc.returncode is None:
-            self.proc.poll()
-        self.stderr_tail.append(f"capture process exited ({self.proc.returncode})")
 
     def _publish(self, frame: bytes) -> None:
         if len(frame) < 64:  # truncated tail: not a frame
             return
         with self.lock:
+            self.frames += 1
+            self._proc_frames += 1
+            self._last_frame = time.monotonic()
+            if frame == self.latest:
+                # an unchanged screen encodes to the same bytes: sending it again
+                # would only make the Switch decode and draw the same picture
+                self.duplicates += 1
+                return
             self.latest = frame
             self.frame_size = jpeg_size(frame) or self.frame_size
-            self.frames += 1
             self.frame_id += 1
             clients = list(self.clients)
         for client in clients:
             client.offer(frame)
 
-    def add_client(self) -> "Client":
-        client = Client()
+    def add_client(self, ip: str = "", mode: str = "ws") -> "Client":
+        client = Client(ip, mode)
         with self.lock:
             self.clients.add(client)
+            latest = self.latest
+        if latest is not None:
+            client.offer(latest)  # an unchanged screen publishes nothing: show it now
         return client
 
     def remove_client(self, client: "Client") -> None:
@@ -1451,26 +1573,44 @@ class Hub:
             self.clients.discard(client)
         client.close()
 
-    def stop(self) -> None:
-        if self.proc and self.proc.poll() is None:
+    def viewers(self) -> list[dict]:
+        with self.lock:
+            clients = list(self.clients)
+        return [c.snapshot() for c in clients]
+
+    @staticmethod
+    def _terminate(proc: subprocess.Popen) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            # a second Ctrl-C while waiting must not leave the capture running
             try:
-                os.killpg(self.proc.pid, signal.SIGTERM)
+                os.killpg(proc.pid, signal.SIGKILL)
             except OSError:
-                self.proc.terminate()
-            try:
-                self.proc.wait(timeout=3)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt):
-                # a second Ctrl-C while waiting must not leave the capture running
-                try:
-                    os.killpg(self.proc.pid, signal.SIGKILL)
-                except OSError:
-                    self.proc.kill()
+                proc.kill()
+
+    def stop(self) -> None:
+        self._stopping.set()
+        with self._proc_lock:
+            proc = self.proc
+        if proc:
+            self._terminate(proc)
 
 
 class Client:
     """A newest-frame queue and an fd which wakes its consumer on publish."""
 
-    def __init__(self):
+    def __init__(self, ip: str = "", mode: str = "ws"):
+        self.ip, self.mode = ip, mode
+        self.connected = time.monotonic()
+        self.sent = self.sent_bytes = 0
+        self.render_fps: float | None = None  # what the viewer says it draws
         self.queue: queue.Queue = queue.Queue(maxsize=1)
         self.wakeup_fd, self.wakeup_write = socket.socketpair()
         self.wakeup_fd.setblocking(False)
@@ -1502,6 +1642,29 @@ class Client:
                     return
             except BlockingIOError:
                 return
+
+    def count(self, frame: bytes) -> None:
+        self.sent += 1
+        self.sent_bytes += len(frame)
+
+    def report(self, text: str) -> None:
+        """A viewer's 'fps,mode' report; anything malformed is ignored."""
+        fps, _, mode = text.partition(",")
+        try:
+            value = float(fps)
+        except ValueError:
+            return
+        if 0 <= value <= 240:  # also rejects nan
+            self.render_fps = round(value, 1)
+            if mode in ("canvas", "img", "pull"):
+                self.mode = mode
+
+    def snapshot(self) -> dict:
+        seconds = max(time.monotonic() - self.connected, 0.001)
+        return {"ip": self.ip, "mode": self.mode, "seconds": round(seconds, 1),
+                "sent": self.sent, "sent_fps": round(self.sent / seconds, 1),
+                "kb_per_frame": round(self.sent_bytes / self.sent / 1024, 1) if self.sent else None,
+                "render_fps": self.render_fps}
 
     def close(self) -> None:
         self.wakeup_fd.close()
@@ -1636,8 +1799,11 @@ class WSClientParser:
 def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                  allowed_hosts: set[str] | None = None,
                  click_allow: set[str] | None = None,
-                 injector: "KeyInjector | None" = None, fill: str = "fit"):
+                 injector: "KeyInjector | None" = None, fill: str = "fit",
+                 gate: "ControlGate | None" = None):
     from http.server import BaseHTTPRequestHandler
+
+    gate = gate or ControlGate(click_allow or ())
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1666,7 +1832,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
             return False
 
         def _click_client_ok(self) -> bool:
-            return not click_allow or self.client_address[0] in click_allow
+            return gate.ok(self.client_address[0])
 
         def do_POST(self):
             if not self._host_ok():
@@ -1717,7 +1883,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 return
             path = self.path.split("?")[0]
             if path == "/":
-                allowed = clicker is not None and self._click_client_ok()
+                allowed = clicker is not None and gate.claim(self.client_address[0])
                 page = render_viewer(allowed, clicker.secret if clicker else "",
                                      allowed and injector is not None,
                                      allowed and injector is not None and injector.text_enabled,
@@ -1731,7 +1897,11 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
             elif path == "/health":
                 body = json.dumps({
                     "frames": hub.frames,
+                    "duplicate_frames": hub.duplicates,
+                    "source_restarts": hub.restarts,
                     "clients": len(hub.clients),
+                    "viewers": hub.viewers(),
+                    "control": gate.snapshot() if clicker else None,
                     "uptime_s": round(time.time() - hub.started, 1),
                     "source_alive": bool(hub.proc and hub.proc.poll() is None),
                     "source_exit_code": hub.proc.returncode if hub.proc else None,
@@ -1755,7 +1925,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.close_connection = True
-                client = hub.add_client()
+                client = hub.add_client(self.client_address[0], "mjpeg")
                 try:
                     while True:
                         try:
@@ -1772,6 +1942,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                         self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
                         self.wfile.write(b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n")
                         self.wfile.write(frame + b"\r\n")
+                        client.count(frame)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 finally:
@@ -1779,7 +1950,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
             elif path == "/ws":
                 if not ws_upgrade(self):
                     return
-                client = hub.add_client()
+                client = hub.add_client(self.client_address[0])
                 parser = WSClientParser()
                 pull = False
                 requested = False
@@ -1809,8 +1980,11 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                                         ws_send_frame(self.connection, payload[:125], 0xA)
                                     if kind == "text":
                                         text = payload.decode("ascii", "ignore")
-                                        if text == "pull":
+                                        if text.startswith("f:"):
+                                            client.report(text[2:])
+                                        elif text == "pull":
                                             pull = True
+                                            client.mode = "pull"
                                             # Do not wait for a frame that the
                                             # viewer cannot render yet.
                                             requested = True
@@ -1831,6 +2005,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                                 pass
                         if frame is not None:
                             ws_send_frame(self.connection, frame)
+                            client.count(frame)
                         elif not pull and timed_out and time.monotonic() - last_ping >= 10:
                             ws_ping(self.connection)
                             last_ping = time.monotonic()
@@ -2121,9 +2296,20 @@ def _parse_xy(text: str) -> tuple[int, int]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Second display for the Nintendo Switch's browser.")
-    ap.add_argument("--port", type=int, default=8090, help="HTTP port (default 8090)")
-    ap.add_argument("--bind", default="0.0.0.0", help="HTTP bind address")
+    ap = argparse.ArgumentParser(
+        description="Second display for the Nintendo Switch's browser.",
+        fromfile_prefix_chars="@",
+        epilog="Options can live in a file, one per line (for example --click-secret=...), "
+               "loaded with @FILE: that keeps the secret out of shell history and ps.")
+    ap.add_argument("--switch", action="store_true",
+                    help="everything a stock Switch needs, on this machine's LAN address: "
+                         "--bind LAN-IP --port 80 --dns-port 53 --dns-answer LAN-IP "
+                         "(needs sudo; each can still be set explicitly)")
+    ap.add_argument("--port", type=int, default=None,
+                    help="HTTP port (default 8090, or 80 with --switch)")
+    ap.add_argument("--bind", default=None,
+                    help="HTTP bind address (default 0.0.0.0, or the LAN address with "
+                         "--switch or --click-secret)")
     ap.add_argument("--preset", choices=sorted(PRESETS), default=None,
                      help="capture preset: test | mac-mirror | mac-extended | x11 (default test)")
     ap.add_argument("--profile", choices=sorted(PROFILES), default=None,
@@ -2153,7 +2339,7 @@ def main() -> int:
                          "the viewer's fill button switches live)")
     ap.add_argument("--static", action="store_true",
                     help="drop unchanged frames with mpdecimate (preset capture only)")
-    ap.add_argument("--dns-port", type=int, default=0,
+    ap.add_argument("--dns-port", type=int, default=None,
                     help="also answer DNS A queries on this port (53 needs root)")
     ap.add_argument("--dns-answer", default=None, help="IP to answer with (default: LAN IP)")
     ap.add_argument("--dns-bind", default=None,
@@ -2187,10 +2373,22 @@ def main() -> int:
     ap.add_argument("--allow-host", action="append", default=[],
                     help="additional HTTP Host name allowed (repeatable)")
     ap.add_argument("--click-allow", action="append", default=[], metavar="IP",
-                    help="only this client IP may click or receive the secret (repeatable)")
+                    help="only this client IP may click or receive the secret (repeatable). "
+                         "Without it, the first device to open the viewer is the only one "
+                         "that can control this machine until the server restarts")
+    ap.add_argument("--no-restart", action="store_true",
+                    help="don't restart the capture command when it exits or stalls")
     args = ap.parse_args()
     if args.list_displays:
         return list_displays()
+    lan_ip = _lan_ip()
+    if args.switch:
+        args.bind = args.bind or lan_ip
+        args.port = 80 if args.port is None else args.port
+        args.dns_port = 53 if args.dns_port is None else args.dns_port
+    args.bind = args.bind or "0.0.0.0"
+    args.port = 8090 if args.port is None else args.port
+    args.dns_port = args.dns_port or 0
 
     pw, ph, pf = PRESETS[args.preset or "test"]
     if args.profile:
@@ -2250,7 +2448,6 @@ def main() -> int:
                                bounds=(*clicker.origin, *clicker.display_size)
                                if clicker.display_size else None,
                                text_enabled=args.text)
-    lan_ip = _lan_ip()
     if clicker and args.bind == "0.0.0.0":
         args.bind = lan_ip
         print(f"[http] click enabled; binding to LAN IP {lan_ip} instead of 0.0.0.0", flush=True)
@@ -2261,11 +2458,25 @@ def main() -> int:
         dns_bind = args.dns_bind or answer
         dns_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         dns_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        dns_sock.bind((dns_bind, args.dns_port))
-    hub = Hub(cmd)
-    server = LocalThreadingHTTPServer((args.bind, args.port),
-                                 make_handler(hub, clicker, allowed_hosts, set(args.click_allow),
-                                              injector, args.fill))
+        try:
+            dns_sock.bind((dns_bind, args.dns_port))
+        except OSError as exc:
+            raise SystemExit(_bind_help("DNS", dns_bind, args.dns_port, exc))
+    # Presets send frames continuously, so silence means a stuck capture. A custom
+    # --source or --static may legitimately go quiet, so those only restart on exit.
+    preset_capture = not args.source
+    hub = Hub(cmd, restart=not args.no_restart,
+              restart_stalled=preset_capture and not args.no_restart,
+              stall_s=15.0 if preset_capture and not args.static and not args.no_restart else None)
+    # the Mac itself may always control: loopback, or its own LAN address
+    gate = ControlGate(args.click_allow, local={lan_ip, args.bind} - {"0.0.0.0", "::"})
+    try:
+        server = LocalThreadingHTTPServer(
+            (args.bind, args.port),
+            make_handler(hub, clicker, allowed_hosts, set(args.click_allow), injector,
+                         args.fill, gate))
+    except OSError as exc:
+        raise SystemExit(_bind_help("HTTP", args.bind, args.port, exc))
     server.daemon_threads = True
     if os.geteuid() == 0 and os.environ.get("SUDO_UID"):
         uid, gid = int(os.environ["SUDO_UID"]), int(os.environ.get("SUDO_GID", "0"))
@@ -2276,7 +2487,11 @@ def main() -> int:
         os.setgid(gid)
         os.setuid(uid)
         print(f"[priv] dropped privileges to uid={uid} gid={gid}", flush=True)
-    hub.start()
+    try:
+        hub.start()
+    except OSError as exc:
+        raise SystemExit(f"cannot start the capture command ({exc}). The presets need ffmpeg: "
+                         "brew install ffmpeg (macOS) or your package manager (Linux).")
     if dns_sock:
         threading.Thread(target=dns_responder,
                          args=(dns_sock, answer,
@@ -2291,6 +2506,12 @@ def main() -> int:
             print("[click] warning: --click-display-size omitted; mapping to frame size", flush=True)
         print(f"[click] tap-to-click ON{' (DRY RUN)' if clicker.dry_run else ''} "
               f"secret=set display={size} origin={clicker.origin}", flush=True)
+        if args.click_allow:
+            print(f"[lock] control allowed only from {', '.join(sorted(args.click_allow))}",
+                  flush=True)
+        else:
+            print("[lock] the first device to open the viewer becomes the only one that can "
+                  "control this machine (others are view-only)", flush=True)
         if not clicker.dry_run and accessibility_trusted(prompt=True) is False:
             print(f"[click] warning: taps will be refused until you {ACCESSIBILITY_HELP}. "
                   "macOS has been asked to show its permission prompt.", flush=True)
@@ -2320,6 +2541,13 @@ def main() -> int:
             injector.close()
         hub.stop()
     return 0
+
+
+def _bind_help(what: str, addr: str, port: int, exc: OSError) -> str:
+    hint = ""
+    if isinstance(exc, PermissionError) or (port < 1024 and os.geteuid() != 0):
+        hint = " Ports below 1024 need sudo."
+    return f"cannot bind {what} to {addr}:{port} ({exc.strerror or exc}).{hint}"
 
 
 def _lan_ip() -> str:
