@@ -32,7 +32,6 @@ import os
 import queue
 import re
 import shlex
-import shutil
 import socket
 import struct
 import subprocess
@@ -724,7 +723,7 @@ def mac_displays() -> list[dict]:
 
     ffmpeg's avfoundation input numbers screens in CGGetActiveDisplayList order,
     so entry N here is "Capture screen N". Bounds are global points with a
-    top-left origin — exactly what cliclick and CGEvent expect.
+    top-left origin — exactly what CGEvent expects.
     """
     q = _coregraphics()
     if q is None:
@@ -1312,11 +1311,6 @@ class Clicker:
 
     def _rate_ok(self, ip: str) -> bool:
         now = time.monotonic()
-        if len(self._by_ip) > 256:  # bounded: forget clients with nothing recent
-            for old in [k for k, v in self._by_ip.items()
-                        if not v or now - v[-1] >= self.window_s]:
-                self._by_ip.pop(old, None)
-                self._last_time.pop(old, None)
         if now - self._last_time.get(ip, float("-inf")) < self.min_gap_s:
             return False
         q = self._by_ip.setdefault(ip, [])
@@ -1326,18 +1320,6 @@ class Clicker:
         q.append(now)
         self._last_time[ip] = now
         return True
-
-    def synthesizer(self, px: int, py: int) -> tuple[str, list[str]]:
-        cliclick = shutil.which("cliclick")
-        if cliclick:
-            # cliclick reads a leading '-' as relative; '=' forces absolute, which
-            # matters for displays left of or above the main one
-            fmt = lambda v: f"={v}" if v < 0 else str(v)
-            return "cliclick", [cliclick, f"c:{fmt(px)},{fmt(py)}"]
-        if _coregraphics() is not None:
-            return "quartz", ["CGEventPost", f"leftclick:{px},{py}"]
-        script = f'tell application "System Events" to click at {{{px}, {py}}}'
-        return "osascript", ["osascript", "-e", script]
 
     def click(self, ip: str, x: float, y: float,
               frame_size: tuple[int, int] | None) -> tuple[int, dict]:
@@ -1361,7 +1343,6 @@ class Clicker:
         px = ox + min(max(0, int(round(nx * dw))), dw - 1)
         py = oy + min(max(0, int(round(ny * dh))), dh - 1)
 
-        tool, argv = self.synthesizer(px, py)
         if self.dry_run:
             result = "dry-run"
         elif accessibility_trusted() is False:
@@ -1371,24 +1352,19 @@ class Clicker:
             return 503, {"error": "Accessibility permission missing", "fix": ACCESSIBILITY_HELP}
         else:
             try:
-                if tool == "quartz":
-                    quartz_click(px, py)
-                else:
-                    subprocess.run(argv, check=True, timeout=3,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                quartz_click(px, py)
                 result = "clicked"
-            except (OSError, subprocess.SubprocessError) as exc:
+            except OSError as exc:
                 with self._lock:
-                    self.stats["failed"] = self.stats.get("failed", 0) + 1
-                return 502, {"error": f"{tool} failed", "detail": type(exc).__name__,
-                             "command": " ".join(argv)}
+                    self.stats["failed"] += 1
+                return 502, {"error": f"click failed: {exc}"}
 
         with self._lock:
             self.stats["synthesized"] += 1
             self.last_click = {"nx": round(nx, 4), "ny": round(ny, 4),
-                               "px": px, "py": py, "tool": tool,
+                               "px": px, "py": py,
                                "result": result, "ts": round(time.time(), 2)}
-        return 200, {"ok": True, "click": self.last_click, "command": " ".join(argv)}
+        return 200, {"ok": True, "click": self.last_click}
 
 
 class JpegStreamSplitter:
@@ -1419,26 +1395,16 @@ class JpegStreamSplitter:
             yield frame
 
 
-def split_jpeg_stream(chunks, max_buffer: int = 8 * 1024 * 1024):
-    """Yield complete JPEGs from arbitrary chunks of a concatenated stream."""
-    splitter = JpegStreamSplitter(max_buffer)
-    for chunk in chunks:
-        yield from splitter.feed(chunk)
-
-
 class Hub:
     """One capture subprocess feeding N websocket clients and the MJPEG endpoint.
 
-    A supervisor thread restarts the capture when it exits (with backoff), and,
-    when asked to, when it never produces a frame or stops producing them.
+    A supervisor thread restarts the capture when it exits (with backoff) and,
+    when asked to, when it never produces a first frame.
     """
 
-    def __init__(self, cmd: list[str], restart: bool = True, restart_stalled: bool = False,
-                 stall_s: float | None = None):
+    def __init__(self, cmd: list[str], restart_stalled: bool = False):
         self.cmd = cmd
-        self.restart = restart                  # start it again when it exits
-        self.restart_stalled = restart_stalled  # ...and when it never sends a first frame
-        self.stall_s = stall_s                  # ...and when frames stop for this long
+        self.restart_stalled = restart_stalled  # also restart when no first frame arrives
         self.latest: bytes | None = None
         self.frame_size: tuple[int, int] | None = None
         self.lock = threading.Lock()
@@ -1452,7 +1418,7 @@ class Hub:
         self.frame_id = 0
         self.no_frames_warn_s = 8.0
         self._proc_frames = 0
-        self._spawned = self._last_frame = time.monotonic()
+        self._spawned = time.monotonic()
         self._stopping = threading.Event()
         self._proc_lock = threading.Lock()
 
@@ -1470,7 +1436,7 @@ class Hub:
                                     stderr=subprocess.PIPE, start_new_session=True)
             self.proc = proc
             self._proc_frames = 0
-            self._spawned = self._last_frame = time.monotonic()
+            self._spawned = time.monotonic()
         threading.Thread(target=self._read_frames, args=(proc,), daemon=True).start()
         threading.Thread(target=self._read_stderr, args=(proc,), daemon=True).start()
 
@@ -1487,9 +1453,7 @@ class Hub:
                     why = next((l for l in reversed(self.stderr_tail) if l), "")
                     self.stderr_tail.append(f"capture process exited ({code})")
                     print(f"[src ] capture exited ({code})" + (f": {why}" if why else "") +
-                          (f"; restarting in {backoff:g} s" if self.restart else ""), flush=True)
-                if not self.restart:
-                    return
+                          f"; restarting in {backoff:g} s", flush=True)
                 if now - exited_at >= backoff:
                     try:
                         self._spawn()
@@ -1500,22 +1464,17 @@ class Hub:
                     self.restarts += 1
                     exited_at, warned = None, False
                 continue
-            if not self._proc_frames:
-                if not warned and now - self._spawned > self.no_frames_warn_s:
-                    warned = True
-                    print(f"[src ] WARNING: no frames after {self.no_frames_warn_s:g} s, so the "
-                          "viewer will stay black" +
-                          ("; restarting the capture" if self.restart_stalled else "") +
-                          ". A stuck capture from an earlier run is the usual cause: if this "
-                          "repeats, stop this server, run pkill -f avfoundation, then start "
-                          "it again.", flush=True)
-                    if self.restart_stalled:
-                        self._terminate(proc)
-            elif self.stall_s and now - self._last_frame > self.stall_s:
-                print(f"[src ] WARNING: no frames for {self.stall_s:g} s; restarting the capture",
-                      flush=True)
-                self._last_frame = now
-                self._terminate(proc)
+            if not self._proc_frames and not warned \
+                    and now - self._spawned > self.no_frames_warn_s:
+                warned = True
+                print(f"[src ] WARNING: no frames after {self.no_frames_warn_s:g} s, so the "
+                      "viewer will stay black" +
+                      ("; restarting the capture" if self.restart_stalled else "") +
+                      ". A stuck capture from an earlier run is the usual cause: if this "
+                      "repeats, stop this server, run pkill -f avfoundation, then start "
+                      "it again.", flush=True)
+                if self.restart_stalled:
+                    self._terminate(proc)
 
     def _read_stderr(self, proc: subprocess.Popen) -> None:
         for line in proc.stderr:
@@ -1546,7 +1505,6 @@ class Hub:
         with self.lock:
             self.frames += 1
             self._proc_frames += 1
-            self._last_frame = time.monotonic()
             if frame == self.latest:
                 # an unchanged screen encodes to the same bytes: sending it again
                 # would only make the Switch decode and draw the same picture
@@ -1671,10 +1629,6 @@ class Client:
         self.wakeup_write.close()
 
 
-def ws_ping(sock: socket.socket) -> None:
-    ws_send_frame(sock, b"", opcode=0x9)
-
-
 def ws_upgrade(handler) -> bool:
     key = handler.headers.get("Sec-WebSocket-Key")
     if not key:
@@ -1721,16 +1675,9 @@ def ws_send_frame(sock: socket.socket, payload: bytes, opcode: int = 0x2) -> Non
         if not writable:
             raise TimeoutError("websocket send timed out")
 
-    use_sendmsg = hasattr(sock, "sendmsg")
     while parts:
         try:
-            if use_sendmsg:
-                sent = sock.sendmsg(parts)
-            else:
-                sent = sock.send(parts[0])
-        except (AttributeError, NotImplementedError):
-            use_sendmsg = False
-            continue
+            sent = sock.sendmsg(parts)
         except (BlockingIOError, InterruptedError):
             wait_writable()
             continue
@@ -2007,7 +1954,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                             ws_send_frame(self.connection, frame)
                             client.count(frame)
                         elif not pull and timed_out and time.monotonic() - last_ping >= 10:
-                            ws_ping(self.connection)
+                            ws_send_frame(self.connection, b"", opcode=0x9)
                             last_ping = time.monotonic()
                 except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
                     pass
@@ -2148,38 +2095,32 @@ def _qv(quality: int) -> int:
     return max(1, min(31, 31 - int(quality * 0.31)))
 
 
-def _scale_filter(width: int, height: int, static: bool, sharp: bool,
-                  stretch: bool = False) -> str:
+def _scale_filter(width: int, height: int, sharp: bool, stretch: bool = False) -> str:
     """Scale to fit. sharp costs some CPU and data but keeps small text readable.
 
     stretch fills width x height exactly, so the viewer needn't enlarge the frame again.
     """
     flags, extra = ("lanczos", ",unsharp=3:3:0.5") if sharp else ("fast_bilinear", "")
     shape = "" if stretch else "force_original_aspect_ratio=decrease:force_divisible_by=2:"
-    return (f"scale={width}:{height}:{shape}flags={flags}{extra}" +
-            (",mpdecimate,setpts=N/FRAME_RATE/TB" if static else ""))
+    return f"scale={width}:{height}:{shape}flags={flags}{extra}"
 
 
-def default_capture_cmd(width: int, height: int, fps: int, quality: int,
-                        static: bool = False) -> list[str]:
-    vf = "mpdecimate,setpts=N/FRAME_RATE/TB" if static else None
+def default_capture_cmd(width: int, height: int, fps: int, quality: int) -> list[str]:
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-re", "-f", "lavfi", "-i", f"testsrc=size={width}x{height}:rate={fps}",
         "-pix_fmt", "yuvj420p", "-huffman", "optimal",
-        *( ["-vf", vf] if vf else [] ),
         "-c:v", "mjpeg", "-q:v", str(_qv(quality)), "-f", "mjpeg", "-",
     ]
 
 
 def mac_capture_cmd(index: int, width: int, height: int, fps: int, quality: int,
-                    static: bool = False, sharp: bool = False, stretch: bool = False) -> list[str]:
+                    sharp: bool = False, stretch: bool = False) -> list[str]:
     """macOS: AVFoundation screen device -> MJPEG on stdout.
 
-    `index` is an AVFoundation video device: a name such as "Capture screen 0"
-    (what --screen produces; stable) or the numeric index printed by
-    `ffmpeg -f avfoundation -list_devices true -i ""` (shifts whenever a camera,
-    iPhone Continuity Camera or Desk View appears ahead of the screens).
+    `index` is an AVFoundation video device name such as "Capture screen 0". The
+    numeric indexes ffmpeg also accepts shift whenever a camera, iPhone Continuity
+    Camera or Desk View appears ahead of the screens, so they are not offered.
     Requires Screen Recording permission for the calling terminal, else frames
     come out black with no error.
     """
@@ -2187,7 +2128,7 @@ def mac_capture_cmd(index: int, width: int, height: int, fps: int, quality: int,
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "avfoundation", "-framerate", str(fps), "-pixel_format", "nv12",
         "-capture_cursor", "1", "-i", f"{index}:none",
-        "-vf", _scale_filter(width, height, static, sharp, stretch),
+        "-vf", _scale_filter(width, height, sharp, stretch),
         # passthrough: the default CFR mode duplicates AVFoundation frames to
         # hundreds of fps (measured ~680 fps for -framerate 15), flooding Wi-Fi
         "-fps_mode", "passthrough",
@@ -2197,11 +2138,11 @@ def mac_capture_cmd(index: int, width: int, height: int, fps: int, quality: int,
 
 
 def x11_capture_cmd(display: str, width: int, height: int, fps: int, quality: int,
-                    static: bool = False, sharp: bool = False, stretch: bool = False) -> list[str]:
+                    sharp: bool = False, stretch: bool = False) -> list[str]:
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "x11grab", "-framerate", str(fps), "-i", display,
-        "-vf", _scale_filter(width, height, static, sharp, stretch),
+        "-vf", _scale_filter(width, height, sharp, stretch),
         "-pix_fmt", "yuvj420p", "-huffman", "optimal",
         "-c:v", "mjpeg", "-q:v", str(_qv(quality)), "-f", "mjpeg", "-",
     ]
@@ -2232,31 +2173,24 @@ def resolve_capture(args) -> list[str]:
     preset = args.preset or "test"
     quality = args.quality
     if preset == "test":
-        return default_capture_cmd(args.width, args.height, args.fps, quality, getattr(args, "static", False))
+        return default_capture_cmd(args.width, args.height, args.fps, quality)
     if preset in ("mac-mirror", "mac-extended"):
-        return mac_capture_cmd(_mac_device(args), args.width, args.height, args.fps, quality,
-                               getattr(args, "static", False), getattr(args, "profile", None) == "text",
+        return mac_capture_cmd(f"Capture screen {_mac_screen(args)}", args.width, args.height, args.fps, quality,
+                               getattr(args, "profile", None) == "text",
                                getattr(args, "fill", "fit") == "stretch")
     if preset == "x11":
         return x11_capture_cmd(args.display, args.width, args.height, args.fps, quality,
-                               getattr(args, "static", False), getattr(args, "profile", None) == "text",
+                               getattr(args, "profile", None) == "text",
                                getattr(args, "fill", "fit") == "stretch")
     raise SystemExit(f"unknown preset: {preset}")
 
 
-def _mac_screen(args) -> int | None:
-    """The "Capture screen N" a mac preset captures, or None for a raw --display-index."""
-    if getattr(args, "display_index", None) is not None:
-        return None
+def _mac_screen(args) -> int:
+    """The "Capture screen N" a mac preset captures."""
     screen = getattr(args, "screen", None)
     if screen is None:
         screen = 1 if args.preset == "mac-extended" else 0
     return screen
-
-
-def _mac_device(args) -> str | int:
-    screen = _mac_screen(args)
-    return args.display_index if screen is None else f"Capture screen {screen}"
 
 
 def list_displays() -> int:
@@ -2322,9 +2256,6 @@ def main() -> int:
     ap.add_argument("--screen", type=int, default=None,
                     help="mac presets: capture \"Capture screen N\" (default 0 for "
                          "mac-mirror, 1 for mac-extended); see --list-displays")
-    ap.add_argument("--display-index", type=int, default=None,
-                    help="mac presets: raw AVFoundation device index instead of --screen "
-                         "(cameras shift it; prefer --screen)")
     ap.add_argument("--list-displays", action="store_true",
                     help="macOS: list screens with their size/origin in points and exit")
     ap.add_argument("--display", default=":0.0", help="X11 display for the x11 preset")
@@ -2337,8 +2268,6 @@ def main() -> int:
                     help="how the picture fills the Switch screen: fit keeps it all with black "
                          "bars, crop cuts the overflow, stretch changes its shape (default fit; "
                          "the viewer's fill button switches live)")
-    ap.add_argument("--static", action="store_true",
-                    help="drop unchanged frames with mpdecimate (preset capture only)")
     ap.add_argument("--dns-port", type=int, default=None,
                     help="also answer DNS A queries on this port (53 needs root)")
     ap.add_argument("--dns-answer", default=None, help="IP to answer with (default: LAN IP)")
@@ -2357,7 +2286,7 @@ def main() -> int:
                     help="display origin in global screen coordinates (default 0,0; "
                          "negative needs the = form: --click-display-origin=-1920,0)")
     ap.add_argument("--click-dry-run", action="store_true",
-                     help="log the synthesizer command instead of clicking (safe test)")
+                     help="resolve and log clicks and keys but perform none (safe test)")
     ap.add_argument("--keys", action="store_true",
                     help="forward Joy-Con/touch-pad input as Mac key presses "
                          "(needs --click-secret; only keys in the keymap can be pressed)")
@@ -2376,8 +2305,6 @@ def main() -> int:
                     help="only this client IP may click or receive the secret (repeatable). "
                          "Without it, the first device to open the viewer is the only one "
                          "that can control this machine until the server restarts")
-    ap.add_argument("--no-restart", action="store_true",
-                    help="don't restart the capture command when it exits or stalls")
     args = ap.parse_args()
     if args.list_displays:
         return list_displays()
@@ -2462,12 +2389,9 @@ def main() -> int:
             dns_sock.bind((dns_bind, args.dns_port))
         except OSError as exc:
             raise SystemExit(_bind_help("DNS", dns_bind, args.dns_port, exc))
-    # Presets send frames continuously, so silence means a stuck capture. A custom
-    # --source or --static may legitimately go quiet, so those only restart on exit.
-    preset_capture = not args.source
-    hub = Hub(cmd, restart=not args.no_restart,
-              restart_stalled=preset_capture and not args.no_restart,
-              stall_s=15.0 if preset_capture and not args.static and not args.no_restart else None)
+    # A preset that sends no first frame is stuck; a custom --source may just be slow
+    # to start (a portal dialog, say), so that one is only restarted when it exits.
+    hub = Hub(cmd, restart_stalled=not args.source)
     # the Mac itself may always control: loopback, or its own LAN address
     gate = ControlGate(args.click_allow, local={lan_ip, args.bind} - {"0.0.0.0", "::"})
     try:

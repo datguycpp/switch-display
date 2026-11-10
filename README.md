@@ -121,11 +121,10 @@ tables and a `fast_bilinear` scaler (where scaling is present). On the local
 test source, optimal Huffman reduced frame bytes by about 25% and
 `fast_bilinear` reduced encoder CPU by about 22% (machine/source dependent).
 
-`--static` is opt-in for presets and adds `mpdecimate,setpts=N/FRAME_RATE/TB`
-after scaling, so unchanged screens can stop producing frames. The server
-keeps MJPEG and WebSocket connections alive with keepalives and the viewer
-does not reconnect merely because a frame is unchanged. Custom `--source`
-commands are intentionally untouched; add those filters yourself if needed.
+An unchanged screen encodes to the same bytes, and the server does not send a
+frame identical to the previous one (measured on a still region of a Mac
+screen: 81 of 82 frames skipped). That holds for presets and custom `--source`
+commands alike, and connections stay open with keepalives meanwhile.
 
 The viewer supports `?mode=canvas` (default WebSocket canvas), `?mode=img`
 (WebSocket image), `?mode=mjpeg` (native multipart image), and `?mode=pull`
@@ -159,11 +158,10 @@ previous one and were not sent, so `sent_fps` drops to zero on a still screen.
 ### Capture restarts by itself
 
 If the capture command exits, the server starts it again (after 1 s, backing off
-to 15 s while it keeps failing) and `/health` counts `source_restarts`. Preset
-captures are also restarted when they never produce a first frame, or stop
-producing frames for 15 s. A custom `--source` and `--static` may legitimately go
-quiet, so those are only restarted when they exit. `--no-restart` turns all of
-this off.
+to 15 s while it keeps failing) and `/health` counts `source_restarts`. A preset
+capture that produces no first frame within 8 s is stuck, and is restarted too.
+A custom `--source` may just be slow to start, so it is only restarted when it
+exits.
 
 ### Options in a file
 
@@ -187,9 +185,8 @@ no keyboard. Enabled only when a shared secret is supplied:
 --click-display-size 1280x720 --click-display-origin 1920,27
 ```
 
-Synthesizer: `cliclick` if installed, otherwise a CoreGraphics `CGEvent` posted
-directly (`quartz`, no install needed), with `osascript` as a last resort if
-CoreGraphics can't be loaded. All of them need **Accessibility** permission for the terminal
+Clicks are posted as CoreGraphics `CGEvent`s, so there is nothing to install and
+they work on macOS only. They need **Accessibility** permission for the terminal
 (capture needs **Screen Recording**, which is a separate permission). Without a
 secret `/click` returns 403 and the page renders view-only.
 
@@ -257,14 +254,6 @@ Extended (not mirrored) desktop: on macOS use a BetterDisplay dummy
 (MAC-SETUP.md); on Hyprland `hyprctl output create headless`; KDE Plasma has no
 user-creatable virtual output, so on KDE this is a mirror of a screen region.
 
-### On the host Mac
-
-Full runbook: **[MAC-SETUP.md](MAC-SETUP.md)** — prerequisites (5 GHz Wi‑Fi, `brew install ffmpeg`,
-Screen Recording permission for the terminal, firewall prompt, LAN IP
-`<mac-lan-ip>`), both run lines, the Switch-side DNS steps (primary
-`<mac-lan-ip>`, secondary `8.8.8.8`, portal applet, revert to Auto), and a
-symptom→cause table (black frames = missing permission, etc.).
-
 ### Pointing the Switch at it (no modding)
 
 1. On the host: `sudo python3 switchdisplay.py --switch` (ports 53 and 80 need
@@ -288,48 +277,8 @@ tools/check_viewer_es5.sh                  # parses the viewer script as strict 
 ```
 
 Both run on every push and pull request (`.github/workflows/tests.yml`). The
-unit tests also scan the viewer script for ES6 syntax, which the Switch's browser
-cannot parse.
+ES5 check matters because the Switch's browser stops at the first ES6 token.
 
-## 6. First prototype checks (Linux host, 2026-10-23)
-
-These predate Joy-Con input, the keyboard, fill modes and the control lock.
-
-* server → `/health`: `{"frames": 406, "source_alive": true}` (test source)
-* `/mjpeg`: 7 JPEG parts in 3 s, ~20 KB/frame
-* `/ws`: 87 binary JPEG frames in 5.1 s (**17.2 fps** on the wire)
-* real browser (Chromium, same page): mode `ws`, **25 frames rendered in 2 s
-  (12.5 fps)**, canvas 960×540 with a decoded pixel `(254,255,0)` — i.e. the
-  Blob→Image→`drawImage` path really draws
-* layout check after the ES5 hardening: viewport 780×437 → canvas CSS
-  777×437 (16:9 of 960×540) centred at `left:2px`, frames still arriving —
-  the manual letterbox replaces `object-fit` (Safari 10+, unavailable on the Switch)
-* page JS is ES5-clean (no arrows/let/const/template literals/fetch/async) —
-  required for the Switch's WebKit 601.6-class engine
-* DNS responder: `conntest.nintendowifi.net` and `ctest.cdn.nintendo.net`
-  resolve to the configured answer; other names refused
-* tap-to-click (all with `--click-dry-run` or a fake `cliclick` on PATH, so no
-  cursor was ever moved): wrong secret → `403`; no secret configured → `403` and
-  the page renders view-only; centre tap `(480,270)` of a 960×540 frame
-  → `nx/ny 0.5`, `px/py 756,491` on a 1512×982 display; corners `(0,0)`/`(959,539)`
-  → `0,0`/`1510,980`; out-of-frame `(5000,270)` → `400`; 15 rapid taps → mixed
-  `200`/`429`; counters reconciled exactly (`received = limited +
-  synthesized + bad_coords`); real execution path ran the synthesizer and the
-  fake `cliclick` logged `c:756,491`
-* **not tested then:** the Switch itself, and real screen
-  capture on Wayland (needs a portal approval dialog / OBS v4l2loopback)
-
-The viewer has since been used on a console (see MAC-SETUP.md), but no frame
-rates from it are recorded here. Expect fewer than 12.5 fps (no JIT): fine for
-text and static dashboards, poor for video or scrolling. `/health` `viewers`
-gives the real figure for your setup.
-
-## 7. Trying it yourself
-
-* The host needs to be reachable on the LAN (no remote shell is assumed —
-  install and run the server on the host itself).
-* the Switch, its DNS change (and setting it back afterwards)
-* a capture choice on the Mac: `brew install ffmpeg` (best), the zero-install
-  `screencapture` loop, or Screen Recording permission for a portal-based tool
-* only if the browser route disappoints: modding for Moonlight-NX (+ Sunshine on
-  the Mac)
+No frame rates from a console are recorded here. Expect fewer than a desktop
+browser's (no JIT): fine for text and still dashboards, poor for video or
+scrolling. `/health` `viewers` gives the real figure for your setup.

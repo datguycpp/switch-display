@@ -18,7 +18,6 @@ duration, and changed back afterwards.
 | **Python 3** | `python3 --version`. If macOS asks to install Command Line Tools, accept once. |
 | **ffmpeg** | `brew install ffmpeg` (needs Homebrew). Verify: `ffmpeg -version`. |
 | **Screen Recording permission** | System Settings → Privacy & Security → **Screen Recording** → enable **Terminal** (or iTerm/the app you launch from), then **quit and reopen** that terminal. *Without this, AVFoundation returns BLACK frames and no error.* |
-| **cliclick** (tap-to-click, optional) | Not required: the server posts clicks itself through CoreGraphics (`quartz`). If `cliclick` is installed (`brew install cliclick`) it is used instead. |
 | **Accessibility permission** (tap-to-click) | System Settings → Privacy & Security → **Accessibility** → enable **Terminal**, then restart it. On startup the server checks this and, if it's missing, asks macOS to show its permission prompt. Until it's granted, taps are refused with `503 Accessibility permission missing`, and the Switch HUD shows that message. (macOS would otherwise drop the click silently.) |
 | **macOS firewall** | When `python3` first listens, macOS asks "Allow incoming network connections?" → **Allow**. If it never asked, check System Settings → Network → Firewall. |
 | **Script on the Mac** | Taildrop or `scp` `switchdisplay.py` to the Mac (single file, stdlib only, no pip). |
@@ -34,11 +33,7 @@ python3 switchdisplay.py --list-displays
 ```
 
 Pick a screen with `--screen N`. Screens are captured by name (`Capture screen N`),
-so cameras don't get in the way. The raw AVFoundation index from
-`ffmpeg -f avfoundation -list_devices true -i ""` counts cameras first, and an
-iPhone Continuity Camera or Desk View can push the screens to index 4–5. With
-`--display-index 1` you can end up streaming a webcam. Only use `--display-index`
-if you know you need it.
+so cameras, an iPhone Continuity Camera or Desk View don't get in the way.
 
 ---
 
@@ -188,8 +183,7 @@ keyboard** — tap-as-click only.
 
 **Setup**
 
-1. Nothing to install: the server posts the click through CoreGraphics
-   (`tool: "quartz"`). If `cliclick` is on PATH it is used instead.
+1. Nothing to install: the server posts the click through CoreGraphics.
 2. Grant **Accessibility** permission to the terminal running the server
    (System Settings → Privacy & Security → Accessibility), then restart it.
    Screen Recording (needed for capture) is a *separate* permission.
@@ -199,19 +193,18 @@ keyboard** — tap-as-click only.
 4. Display geometry is auto-detected for the `--screen` you capture (check the
    `[click] screen N: ... (auto-detected)` startup line). Override with
    `--click-display-size`/`--click-display-origin` only when capturing via
-   `--display-index` or a custom `--source`.
+   a custom `--source`.
 
 **Test it without moving the cursor first**
 
-Add `--click-dry-run`: the server resolves and logs the synthesizer command but
-executes nothing.
+Add `--click-dry-run`: the server works out where the click would land and
+reports it, but performs nothing.
 
 ```bash
 curl -s -X POST http://<mac-lan-ip>:80/click \
   -H 'Content-Type: application/json' \
   -d '{"x":480,"y":270,"secret":"YOUR-SECRET"}'
-# {"ok":true,"click":{"nx":0.5755,"ny":0.5,"px":1105,"py":622,"tool":"quartz","result":"dry-run",...},
-#  "command":"CGEventPost leftclick:1105,622"}
+# {"ok":true,"click":{"nx":0.5755,"ny":0.5,"px":1105,"py":622,"result":"dry-run",...}}
 ```
 
 The frame keeps the display's aspect ratio (a 1920×1243 display becomes
@@ -225,7 +218,7 @@ centre of the frame must land at the centre of the display. Then drop
 curl -s http://<mac-lan-ip>:80/health | python3 -m json.tool
 # "accessibility": true      <- false means macOS will not accept synthesized clicks
 # "clicks": {"received":N,"rejected":0,"limited":0,"synthesized":N,"bad_coords":0}
-# "last_click": {"nx":..,"ny":..,"px":..,"py":..,"tool":"cliclick","result":"clicked"}
+# "last_click": {"nx":..,"ny":..,"px":..,"py":..,"result":"clicked"}
 ```
 
 **Guardrails**
@@ -389,9 +382,8 @@ good and the problem is the Switch's DNS/applet step.
 | Joy-Con buttons do nothing | Check the HUD and `/health` `input.seen`. Nothing arriving means the browser keeps that button; use the touch pad. `k<code>` arriving means it isn't mapped: add `--keymap k<code>=KEY` |
 | HUD shows `keys...` | the `/input` socket is reconnecting; check that the server was started with `--keys` |
 | A key stays held in the game | it releases within 1.5 s by itself. If it doesn't, check `/health` `input.held` and report it |
-| `502` + `failed` counter climbing | the synthesizer itself errored (e.g. a broken `cliclick`); the response's `command` shows what ran |
+| `502` + `failed` counter climbing | CoreGraphics refused the click; the response's `error` says why |
 | Wrong screen shown | screens changed. Re-run `python3 switchdisplay.py --list-displays` and pick `--screen N` |
-| A webcam is shown instead of the screen | `--display-index` points at a camera. Drop it and use `--screen N` |
 | `/health` frames climb by hundreds per second | a custom `--source` without `-fps_mode passthrough` (the presets include it) |
 
 ### Limits

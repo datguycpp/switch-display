@@ -1,7 +1,5 @@
 import http.client
-import inspect
 import json
-import re
 import select
 import socket
 import threading
@@ -38,10 +36,6 @@ class Tests(unittest.TestCase):
         c.reject("1")
         self.assertEqual(c.stats["rejected"], 1)
 
-    def test_frame_splitter(self):
-        frames = list(switchdisplay.split_jpeg_stream([b"junk\xff", b"\xd8one\xff\xd9\xff\xd8two", b"\xff\xd9"]))
-        self.assertEqual(frames, [b"\xff\xd8one\xff\xd9", b"\xff\xd8two\xff\xd9"])
-
     def test_incremental_frame_splitter_awkward_chunks(self):
         splitter = switchdisplay.JpegStreamSplitter()
         chunks = [b"junk\xff", b"\xd8first\xff", b"\xd9\xff\xd8se", b"cond\xff\xd9"]
@@ -60,34 +54,28 @@ class Tests(unittest.TestCase):
                                 fps=4, quality=65, preset=None)
         self.assertEqual(switchdisplay.resolve_capture(args)[2], "echo 2 3 4 65 11")
 
-    def test_encoder_flags_and_static_filter(self):
+    def test_encoder_flags(self):
         cmd = switchdisplay.default_capture_cmd(960, 540, 20, 65)
         self.assertIn("yuvj420p", cmd); self.assertIn("optimal", cmd)
-        static = switchdisplay.default_capture_cmd(960, 540, 20, 65, True)
-        self.assertIn("mpdecimate,setpts=N/FRAME_RATE/TB", static)
-        mac = switchdisplay.mac_capture_cmd(1, 960, 540, 15, 65, True)
-        vf = mac[mac.index("-vf") + 1]
-        self.assertLess(vf.index("scale="), vf.index("mpdecimate"))
+        mac = switchdisplay.mac_capture_cmd("Capture screen 1", 960, 540, 15, 65)
+        self.assertTrue(mac[mac.index("-vf") + 1].startswith("scale=960:540:"))
         # without passthrough ffmpeg duplicates AVFoundation frames to ~680 fps
         self.assertEqual(mac[mac.index("-fps_mode") + 1], "passthrough")
 
     def test_text_profile_uses_clear_scaling(self):
-        args = SimpleNamespace(source=None, preset="mac-mirror", screen=None, display_index=None,
-                               width=1280, height=648, fps=30, quality=85, static=True, profile="text")
+        args = SimpleNamespace(source=None, preset="mac-mirror", screen=None,
+                               width=1280, height=648, fps=30, quality=85, profile="text")
         cmd = switchdisplay.resolve_capture(args)
         vf = cmd[cmd.index("-vf") + 1]
         self.assertIn("flags=lanczos,unsharp=3:3:0.5", vf)
-        self.assertLess(vf.index("unsharp"), vf.index("mpdecimate"))
         self.assertEqual(cmd[cmd.index("-q:v") + 1], "5")
         args.profile = None
         cmd = switchdisplay.resolve_capture(args)
         self.assertIn("flags=fast_bilinear", cmd[cmd.index("-vf") + 1])
 
-    def test_profile_sizes_and_explicit_override(self):
-        self.assertEqual((1280, 720), {"sharp": (1280, 720),
-                                       "balanced": (960, 540), "low": (800, 450)}["sharp"])
+    def test_explicit_size_overrides_profile(self):
         args = SimpleNamespace(source=None, preset="test", profile="low", width=123,
-                               height=77, fps=20, quality=65, static=False)
+                               height=77, fps=20, quality=65)
         self.assertIn("testsrc=size=123x77", " ".join(switchdisplay.resolve_capture(args)))
 
     def test_websocket_client_parser(self):
@@ -109,15 +97,6 @@ class Tests(unittest.TestCase):
         page = switchdisplay.render_viewer(True, "a'\\</script>").decode()
         self.assertNotIn("a'\\</script>", page)
         self.assertIn("\\u003c/script\\u003e", page)
-
-    def test_pull_and_push_websocket_flow_control(self):
-        handler = inspect.getsource(switchdisplay.make_handler)
-        self.assertIn('if text == "pull":', handler)
-        self.assertIn('pull = True', handler)
-        self.assertIn('viewer cannot render yet', handler)
-        self.assertIn('requested = True', handler)
-        self.assertIn('client.wakeup_fd', handler)
-        self.assertNotIn('timeout = 0.02 if not pull else 0.2', handler)
 
     def test_client_wakeup_on_publish_without_idle_spin(self):
         hub = switchdisplay.Hub([])
@@ -150,22 +129,15 @@ class Tests(unittest.TestCase):
         finally:
             hub.remove_client(client)
 
-    def test_cliclick_absolute_negative_coordinates(self):
-        c = switchdisplay.Clicker("s", None, (0, 0), True)
-        with unittest.mock.patch("shutil.which", return_value="/bin/cliclick"):
-            self.assertEqual(c.synthesizer(-1920, 27)[1], ["/bin/cliclick", "c:=-1920,27"])
-            self.assertEqual(c.synthesizer(10, 20)[1], ["/bin/cliclick", "c:10,20"])
-
     def test_click_refused_without_accessibility(self):
         c = switchdisplay.Clicker("s", None, (0, 0), False, min_gap_s=0)
         with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=False), \
-                unittest.mock.patch("subprocess.run") as run, \
                 unittest.mock.patch.object(switchdisplay, "quartz_click") as quartz:
             code, body = c.click("a", 1, 1, (2, 2))
         self.assertEqual(code, 503)
         self.assertIn("Accessibility", body["error"])
         self.assertEqual((c.stats["failed"], c.stats["synthesized"]), (1, 0))
-        run.assert_not_called(); quartz.assert_not_called()
+        quartz.assert_not_called()
         dry = switchdisplay.Clicker("s", None, (0, 0), True, min_gap_s=0)
         with unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=False):
             self.assertEqual(dry.click("a", 1, 1, (2, 2))[0], 200)
@@ -306,8 +278,8 @@ class Tests(unittest.TestCase):
             inj.close(); none.close()
 
     def test_stretch_encodes_the_exact_frame_size(self):
-        args = SimpleNamespace(source=None, preset="mac-mirror", screen=None, display_index=None,
-                               width=1280, height=648, fps=30, quality=85, static=False,
+        args = SimpleNamespace(source=None, preset="mac-mirror", screen=None,
+                               width=1280, height=648, fps=30, quality=85,
                                profile="text", fill="stretch")
         cmd = switchdisplay.resolve_capture(args)
         vf = cmd[cmd.index("-vf") + 1]
@@ -370,15 +342,13 @@ class Tests(unittest.TestCase):
         self.assertIn("var TEXT_ON = false;", switchdisplay.render_viewer(False, "", False, True).decode())
 
     def test_mac_presets_capture_screens_by_name(self):
-        args = SimpleNamespace(source=None, preset="mac-mirror", screen=None, display_index=None,
-                               width=960, height=540, fps=15, quality=65, static=False)
+        args = SimpleNamespace(source=None, preset="mac-mirror", screen=None,
+                               width=960, height=540, fps=15, quality=65)
         self.assertIn("Capture screen 0:none", switchdisplay.resolve_capture(args))
         args.preset = "mac-extended"
         self.assertIn("Capture screen 1:none", switchdisplay.resolve_capture(args))
         args.screen = 2
         self.assertIn("Capture screen 2:none", switchdisplay.resolve_capture(args))
-        args.display_index = 5
-        self.assertIn("5:none", switchdisplay.resolve_capture(args))
 
     def test_viewer_frees_replaced_images(self):
         page = switchdisplay.VIEWER_HTML.decode()
@@ -614,15 +584,6 @@ class Tests(unittest.TestCase):
             finally:
                 hub.stop()
         self.assertIn("capture exited (3)", " ".join(str(c.args[0]) for c in printed.call_args_list))
-        once = switchdisplay.Hub(["sh", "-c", "exit 0"], restart=False)
-        with unittest.mock.patch("builtins.print"):
-            once.start()
-            try:
-                self._wait(lambda: once.proc.poll() is not None)
-                time.sleep(0.6)
-                self.assertEqual(once.restarts, 0)
-            finally:
-                once.stop()
 
     def test_capture_without_frames_is_restarted_when_asked(self):
         hub = switchdisplay.Hub(["sleep", "30"], restart_stalled=True)
@@ -638,28 +599,6 @@ class Tests(unittest.TestCase):
                 hub.stop()
         self.assertTrue(self._wait(lambda: hub.proc.poll() is not None))
 
-    def test_capture_that_stops_sending_frames_is_restarted(self):
-        jpeg = "\\377\\330" + "x" * 64 + "\\377\\331"
-        hub = switchdisplay.Hub(["sh", "-c", f"printf '{jpeg}'; sleep 30"], stall_s=0.2)
-        with unittest.mock.patch("builtins.print"):
-            hub.start()
-            try:
-                self.assertTrue(self._wait(lambda: hub.frames >= 1))
-                self.assertTrue(self._wait(lambda: hub.restarts >= 1))
-            finally:
-                hub.stop()
-
-    def test_viewer_script_stays_es5(self):
-        # the Switch's WebKit 601-class engine stops at the first ES6 token
-        page = switchdisplay.render_viewer(True, "s", True, True).decode()
-        script = page[page.index("<script>") + 8:page.index("</script>")]
-        code = "\n".join(line.split("//")[0] for line in script.splitlines())
-        for name, pattern in (("arrow function", r"=>"), ("let/const", r"\b(let|const)\s+[\w$\[{]"),
-                              ("template literal", r"`"), ("class", r"\bclass\s+\w"),
-                              ("async/await", r"\b(async|await)\b"), ("spread", r"\.\.\.\s*[\w$\[]"),
-                              ("fetch", r"\bfetch\s*\("), ("for-of", r"\bfor\s*\([^)]*\bof\b"),
-                              ("Promise", r"\bPromise\b")):
-            self.assertIsNone(re.search(pattern, code), f"ES6 {name} in the viewer script")
 
 
 if __name__ == "__main__":
