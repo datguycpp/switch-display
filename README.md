@@ -1,7 +1,8 @@
 # switchdisplay — a second display on a stock Nintendo Switch
 
-Assessment + minimal prototype: a stock Switch as a wireless second display
-for a Mac or Linux host, using nothing but the console's built-in browser.
+A stock Switch as a wireless second display for a Mac or Linux host, using
+nothing but the console's built-in browser. Optional tap-to-click, Joy-Con
+control and Switch-keyboard text entry send input back to the Mac.
 
 **Short answer:** it works. The Switch's captive-portal browser cannot play
 video, but it can do WebSocket + canvas + JPEG images — and that is all a
@@ -25,8 +26,11 @@ decoding), and the page draws each frame to canvas.
 
 Flow control is ACK-driven: the server holds only the newest frame per viewer
 and drops the rest, so a slow renderer degrades to lower fps instead of
-growing lag. A tap on the page can optionally POST back as a click (behind a
-shared secret) — tap equals one left click, nothing more.
+growing lag. A frame identical to the previous one is not sent at all, so an
+unchanged screen costs the Switch nothing. A tap on the page can optionally
+POST back as one left click, and `--keys`/`--text` add Joy-Con and keyboard
+input. All control sits behind a shared secret that only one device is given
+(see "Who can control the Mac").
 
 ## 2. The Switch angle
 
@@ -79,6 +83,16 @@ prototype. For interactive/low-latency use, Sunshine + Moonlight-NX (modded).
 # which screens exist (size/origin in points)
 python3 switchdisplay.py --list-displays
 
+# everything a stock Switch needs, on this Mac's LAN address:
+# HTTP on port 80 plus the DNS answer on port 53
+sudo python3 switchdisplay.py --switch --preset mac-mirror
+```
+
+`--switch` stands for `--bind <mac-lan-ip> --port 80 --dns-port 53 --dns-answer
+<mac-lan-ip>`; any of those can still be given explicitly. The long form:
+
+```bash
+
 # mirror the main display: 960x540, 15 fps, quality 65
 sudo python3 switchdisplay.py --preset mac-mirror --screen 0 \
   --width 960 --height 540 --fps 15 --quality 65 \
@@ -126,6 +140,42 @@ Endpoints: `/` viewer page, `/ws` binary JPEG WebSocket, `/mjpeg` MJPEG
 fallback, `POST /click` (tap-to-click), `/input` (Joy-Con/touch keys, with
 `--keys`), `/health` counters.
 
+### Measuring what the Switch really draws
+
+`/health` lists every connected viewer under `viewers`: its address, mode, frames
+sent per second, KB per frame, and `render_fps`, which the viewer page reports
+itself every two seconds. Compare modes and profiles with that number instead of
+reading the HUD:
+
+```bash
+curl -s http://<mac-lan-ip>/health | python3 -m json.tool
+# "viewers": [{"ip": "...", "mode": "canvas", "sent_fps": 14.8,
+#              "kb_per_frame": 41.2, "render_fps": 9.5, ...}]
+```
+
+`frames` counts captured frames and `duplicate_frames` those that matched the
+previous one and were not sent, so `sent_fps` drops to zero on a still screen.
+
+### Capture restarts by itself
+
+If the capture command exits, the server starts it again (after 1 s, backing off
+to 15 s while it keeps failing) and `/health` counts `source_restarts`. Preset
+captures are also restarted when they never produce a first frame, or stop
+producing frames for 15 s. A custom `--source` and `--static` may legitimately go
+quiet, so those are only restarted when they exit. `--no-restart` turns all of
+this off.
+
+### Options in a file
+
+Any options can live in a file, one per line, loaded with `@FILE`. That keeps the
+secret out of shell history and `ps`:
+
+```bash
+printf -- '--click-secret=%s\n--keys\n' "$(openssl rand -hex 16)" > ~/.switchdisplay
+chmod 600 ~/.switchdisplay
+sudo python3 switchdisplay.py --switch --preset mac-mirror @$HOME/.switchdisplay
+```
+
 **Tap-to-click** is opt-in and single-purpose: a tap on the Switch becomes one
 left click at that point on the Mac display. No drag, no hover, no right click,
 no keyboard. Enabled only when a shared secret is supplied:
@@ -142,6 +192,17 @@ directly (`quartz`, no install needed), with `osascript` as a last resort if
 CoreGraphics can't be loaded. All of them need **Accessibility** permission for the terminal
 (capture needs **Screen Recording**, which is a separate permission). Without a
 secret `/click` returns 403 and the page renders view-only.
+
+**Who can control the Mac.** The viewer page carries the secret, so whoever is
+served the controlling page can click, and with `--keys`/`--text` press keys and
+type. The server therefore gives it to one device only: the **first device to
+open the viewer** becomes the controller until the server restarts, and the log
+names it (`[lock] control locked to <ip>`). Every other device gets the
+view-only page and is refused by `/click` and `/input`, even with the right
+secret. Open the viewer on the Switch before anything else on the network does,
+and check that log line. `--click-allow IP` (repeatable) names the controller
+up front instead, which is the safer choice with `--text`. The Mac itself can
+always control, without taking the lock.
 
 **Joy-Con / touch-pad control** (`--keys`, opt-in, needs the click secret) turns
 Switch input into held Mac keys and pointer motion, for example WASD movement in
@@ -206,9 +267,9 @@ symptom→cause table (black frames = missing permission, etc.).
 
 ### Pointing the Switch at it (no modding)
 
-1. On the host: `sudo python3 switchdisplay.py --port 80 --dns-port 53 --dns-answer <lan-ip>`
-   (port 53/80 need root; on this box **port 80 is already occupied** by another
-   service, so use a redirect or stop that service first).
+1. On the host: `sudo python3 switchdisplay.py --switch` (ports 53 and 80 need
+   root, and the server drops back to your user once they are bound; if another
+   service holds port 80, stop it or use `--port 8090` with a redirect).
 2. Switch → System Settings → Internet → Internet Settings → your Wi-Fi →
    Change Settings → DNS Settings → Manual → Primary DNS = laptop IP.
 3. Connect: the Switch reports "Registration is required to use this network" →
@@ -219,7 +280,20 @@ symptom→cause table (black frames = missing permission, etc.).
 The applet closes the session when it decides the portal is satisfied; keeping
 the page served at that hostname keeps it open in practice.
 
-## 5. Verified (this box, 2026-10-23)
+## 5. Tests
+
+```bash
+python3 -m unittest discover -s tests     # stdlib only, about 15 s
+tools/check_viewer_es5.sh                  # parses the viewer script as strict ES5 (needs Node.js)
+```
+
+Both run on every push and pull request (`.github/workflows/tests.yml`). The
+unit tests also scan the viewer script for ES6 syntax, which the Switch's browser
+cannot parse.
+
+## 6. First prototype checks (Linux host, 2026-10-23)
+
+These predate Joy-Con input, the keyboard, fill modes and the control lock.
 
 * server → `/health`: `{"frames": 406, "source_alive": true}` (test source)
 * `/mjpeg`: 7 JPEG parts in 3 s, ~20 KB/frame
@@ -242,13 +316,15 @@ the page served at that hostname keeps it open in practice.
   `200`/`429`; counters reconciled exactly (`received = limited +
   synthesized + bad_coords`); real execution path ran the synthesizer and the
   fake `cliclick` logged `c:756,491`
-* **not tested:** the Switch itself, and real screen
+* **not tested then:** the Switch itself, and real screen
   capture on Wayland (needs a portal approval dialog / OBS v4l2loopback)
 
-Expected on the Switch: lower fps than 12.5 (no JIT), fine for text and static
-dashboards, poor for video or scrolling.
+The viewer has since been used on a console (see MAC-SETUP.md), but no frame
+rates from it are recorded here. Expect fewer than 12.5 fps (no JIT): fine for
+text and static dashboards, poor for video or scrolling. `/health` `viewers`
+gives the real figure for your setup.
 
-## 6. Trying it yourself
+## 7. Trying it yourself
 
 * The host needs to be reachable on the LAN (no remote shell is assumed —
   install and run the server on the host itself).

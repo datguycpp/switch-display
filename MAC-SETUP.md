@@ -44,6 +44,16 @@ if you know you need it.
 
 ## (a) Mirror mode — 960×540, 15 fps, quality 65
 
+The short form, with the preset's defaults and this Mac's LAN address filled in:
+
+```bash
+sudo python3 switchdisplay.py --switch --preset mac-mirror \
+  --click-secret 'CHANGE-ME-to-a-long-random-string'
+```
+
+`--switch` stands for `--bind <mac-lan-ip> --port 80 --dns-port 53 --dns-answer
+<mac-lan-ip>`. The same thing spelled out:
+
 ```bash
 sudo python3 switchdisplay.py \
   --preset mac-mirror \
@@ -227,9 +237,18 @@ curl -s http://<mac-lan-ip>:80/health | python3 -m json.tool
 * With click enabled, the default bind is the LAN address rather than all
   interfaces. Host validation rejects unrelated Host headers; use `--allow-host`
   for an intentional additional name.
-* The page embeds the secret so its tap handler can POST. The secret is readable
-  by allowed LAN clients unless `--click-allow IP` is supplied; treat it as a
-  guard against stray POSTs, not as authentication of a user.
+* The page embeds the secret so its tap handler can POST, so the server gives the
+  controlling page to **one device only**: the first to open the viewer, until the
+  server restarts. The log says which (`[lock] control locked to <ip>`), and
+  `/health` shows it under `control`. Other devices get the view-only page, and
+  their clicks and input are refused even with the right secret. **Open the viewer
+  on the Switch first** and check that the logged address is the Switch's.
+* `--click-allow IP` (repeatable) names the controller up front, so nothing depends
+  on who connects first. Use it with `--text`. The Switch's address is under
+  System Settings → Internet → Connection Status.
+* A browser on the Mac itself can always control and doesn't take the lock.
+* To keep the secret out of shell history and `ps`, put options in a file, one per
+  line (`--click-secret=...`), and pass `@FILE` on the command line.
 
 ---
 
@@ -353,13 +372,16 @@ good and the problem is the Switch's DNS/applet step.
 | Symptom | Cause / fix |
 |---|---|
 | Frames are black | Screen Recording permission missing for the terminal → grant, **restart the terminal** |
-| Viewer stays black, `/health` `frames` stays 0, server warns `no frames` | A stuck capture from an earlier run. Check with `pgrep -fl avfoundation`, stop it with `pkill -f avfoundation`, then restart the server. Also check that the display is awake |
+| Viewer stays black, `/health` `frames` stays 0, server warns `no frames` | The server restarts the capture by itself and counts `source_restarts`. If it keeps repeating, a stuck capture from an earlier run is holding the screen: check with `pgrep -fl avfoundation`, stop it with `pkill -f avfoundation`, then restart the server. Also check that the display is awake |
+| Server logs `capture exited (...)` | ffmpeg stopped; the line carries its last error and the capture is started again automatically. A display that was unplugged or renumbered needs a new `--screen N` |
+| HUD says "view only" although `--click-secret` is set | Another device opened the viewer first and holds control (`[lock]` lines in the log, `control` in `/health`). Restart the server and open the viewer on the Switch first, or pass `--click-allow <switch-ip>` |
+| HUD shows 0 fps on a still screen | Expected: frames identical to the last one aren't sent. `/health` `duplicate_frames` counts them |
 | `Address already in use` on port 53 or 80 | mDNSResponder/another resolver holds it. Bind another interface/service, or use 5353/8090 and pf redirects. DNS example: `rdr on en0 inet proto udp from any to any port 53 -> <mac-lan-ip> port 5353` HTTP example: `rdr on en0 inet proto tcp from any to any port 80 -> <mac-lan-ip> port 8090` (also add matching `nat`/`pass` rules; `sudo pfctl -f <file> -e`) |
 | Switch shows "Could not connect" | Mac firewall blocked `python3`, or the router has client isolation, or Mac and Switch are on different subnets/SSIDs |
 | Stream works on the phone but not the Switch | re-check primary DNS is exactly `<mac-lan-ip>`, secondary `8.8.8.8`, and that the applet (not a normal page) is what opened |
-| Very low fps | expected — the Switch's WebKit has **no JIT**; drop `--width/--height` (e.g. 800×450) or `--fps 10`, or lower `--quality` |
+| Very low fps | expected — the Switch's WebKit has **no JIT**; drop `--width/--height` (e.g. 800×450) or `--fps 10`, or lower `--quality`. `/health` `viewers` shows `render_fps` (what the Switch draws) next to `sent_fps` and `kb_per_frame`, so you can compare settings and `?mode=` choices |
 | Words are hard to read | see [Making text readable](#making-text-readable) |
-| Tap does nothing | HUD says `Accessibility permission missing` → grant it to the terminal, restart the terminal and the server. HUD says "view only" → `--click-secret` was not passed. HUD says `bad secret` → the secret in the page is stale, reload the applet |
+| Tap does nothing | HUD says `Accessibility permission missing` → grant it to the terminal, restart the terminal and the server. HUD says "view only" → `--click-secret` was not passed, or another device holds control (see the "view only" row above). HUD says `bad secret` → the secret in the page is stale, reload the applet |
 | Clicks land offset by a constant amount | `--click-display-size` is in **points**, not Retina pixels; for a dummy also set `--click-display-origin` |
 | `403 bad secret` in `/health` counters | page and server secrets differ — restart the server and reload the applet |
 | Many `429` | rate limit (10 per 3 s, 80 ms apart) — that is deliberate |
@@ -377,6 +399,7 @@ good and the problem is the Switch's DNS/applet step.
 * **Mirror** shows one whole display; **extended** needs BetterDisplay (macOS has
   no built-in user-creatable virtual display).
 * **One session at a time**; the applet is modal and ends when you leave it.
+* **One controlling device** per server run, unless `--click-allow` lists more.
 * **Tap = one left click.** No drag, no hover, no right click. Keys only with
   `--keys`, and then only the keys in the keymap plus right-stick pointer motion.
   For analog movement and low latency use Sunshine (Mac) + Moonlight-NX (Switch,
