@@ -325,7 +325,8 @@ viewer open, then check any of these:
   `gp` means the browser has the Gamepad API, and buttons then show as
   `pad0 btn-a+`.
 * the server log: `[keys] unmapped input 'k113' (map it with --keymap k113=KEY)`
-* `curl -s http://<mac-lan-ip>:80/health`, whose `"input": {"seen": {...}}`
+* `curl -s http://<mac-lan-ip>:80/health` run on the Mac (other devices are not
+  shown which keys were pressed), whose `"input": {"seen": {...}}`
   counts every name received, `"probe"` counts every event type the page received
   (including `gamepad-axes`, `right-stick`, `kb-opened` and `kb-sent`), and
   `"stats"` counts pointer `moves`, `typed` characters and `keyboard_prompts`
