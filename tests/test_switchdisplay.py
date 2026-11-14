@@ -1,7 +1,10 @@
 import http.client
 import json
+import os
 import select
+import shutil
 import socket
+import tempfile
 import threading
 import time
 import unittest
@@ -655,6 +658,130 @@ class Tests(unittest.TestCase):
             self.assertEqual(client.queue.get_nowait(), frame(b"b"))
         finally:
             hub.remove_client(client)
+
+    def _viewer_case(self, name):
+        """Run one tools/viewer_test.js case against the rendered viewer script."""
+        page = switchdisplay.render_viewer(True, "s", True, True).decode()
+        script = page[page.index("<script>") + 8:page.index("</script>")]
+        with tempfile.NamedTemporaryFile("w", suffix=".js") as out:
+            out.write(script)
+            out.flush()
+            harness = os.path.join(os.path.dirname(__file__), "..", "tools", "viewer_test.js")
+            run = subprocess.run(["node", harness, name, out.name], capture_output=True,
+                                 text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "needs Node.js")
+    def test_viewer_mjpeg_reconnects_only_when_frames_stop(self):
+        self._viewer_case("mjpeg")
+
+    @unittest.skipUnless(shutil.which("node"), "needs Node.js")
+    def test_viewer_slow_stick_moves_pointer_beside_a_second_gamepad(self):
+        self._viewer_case("twopads")
+
+    def test_silent_input_socket_is_pinged_then_closed(self):
+        inj = switchdisplay.KeyInjector({}, dry_run=True)
+        clicker = switchdisplay.Clicker("sekrit", None, (0, 0), True)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), switchdisplay.make_handler(
+            switchdisplay.Hub([]), clicker, {"127.0.0.1"}, set(), inj))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        auth, mask = b"auth:sekrit", b"\x01\x02\x03\x04"
+        try:
+            with unittest.mock.patch.object(switchdisplay, "INPUT_IDLE_S", 0.1):
+                sock = socket.create_connection(("127.0.0.1", server.server_port))
+                sock.settimeout(5)
+                sock.sendall(b"GET /input HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+                             b"Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                             b"Sec-WebSocket-Version: 13\r\n\r\n")
+                self.assertIn(b"101", sock.recv(4096))
+                sock.sendall(bytes([0x81, 0x80 | len(auth)]) + mask +
+                             bytes(c ^ mask[i % 4] for i, c in enumerate(auth)))
+                data = b""
+                while True:                                # never answers: a device that left
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                sock.close()
+                self.assertIn(b"\x81\x02ok", data)
+                self.assertTrue(data.endswith(b"\x89\x00\x89\x00"))   # two pings, then closed
+                self.assertTrue(self._wait(lambda: inj.connections == 0))
+        finally:
+            server.shutdown(); server.server_close(); inj.close()
+
+    def test_oversized_click_body_is_not_read_as_a_second_request(self):
+        clicker = switchdisplay.Clicker("sekrit", None, (0, 0), True)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), switchdisplay.make_handler(
+            switchdisplay.Hub([]), clicker, {"127.0.0.1"}))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        body = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n" + b" " * 5000
+        try:
+            sock = socket.create_connection(("127.0.0.1", server.server_port))
+            sock.settimeout(5)
+            sock.sendall(b"POST /click HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: " +
+                         str(len(body)).encode() + b"\r\n\r\n" + body)
+            data = b""
+            try:
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            except ConnectionResetError:                   # closed with our body unread
+                pass
+            sock.close()
+            self.assertTrue(data.startswith(b"HTTP/1.1 413"))
+            self.assertEqual(data.count(b"HTTP/1."), 1)
+        finally:
+            server.shutdown(); server.server_close()
+
+    def test_auto_detected_display_geometry_follows_changes(self):
+        clicker = switchdisplay.Clicker("s", (1000, 500), (0, 0), True, min_gap_s=0, screen=1)
+        inj = switchdisplay.KeyInjector({}, dry_run=True, bounds=(0, 0, 1000, 500),
+                                        geometry=clicker)
+        moved = [{"screen": 1, "id": 7, "origin": (-2000, 100), "size": (2000, 1000)}]
+        try:
+            with unittest.mock.patch.object(switchdisplay, "mac_displays", return_value=moved), \
+                    unittest.mock.patch("builtins.print"):
+                self.assertEqual(clicker.click("a", 50, 50, (100, 100))[1]["click"]["px"], 500)
+                clicker._refreshed = float("-inf")         # more than a second later
+                click = clicker.click("a", 50, 50, (100, 100))[1]["click"]
+                self.assertEqual((click["px"], click["py"]), (-1000, 600))
+                inj.move(1, 1)
+                self.assertEqual(inj.bounds, (-2000, 100, 2000, 1000))
+            fixed = switchdisplay.Clicker("s", (1000, 500), (0, 0), True, min_gap_s=0)
+            fixed._refreshed = float("-inf")               # --click-display-size: left alone
+            with unittest.mock.patch.object(switchdisplay, "mac_displays", return_value=moved):
+                self.assertEqual(fixed.click("a", 50, 50, (100, 100))[1]["click"]["px"], 500)
+        finally:
+            inj.close()
+
+    def test_capture_that_stops_sending_frames_is_restarted(self):
+        hub = switchdisplay.Hub(["sleep", "30"], restart_stalled=True)
+        hub.no_frames_warn_s, hub.stall_s = 30, 0.2
+        with unittest.mock.patch("builtins.print"):
+            hub.start()
+            first = hub.proc
+            try:
+                hub._publish(b"\xff\xd8" + b"a" * 64 + b"\xff\xd9")   # it worked, then went quiet
+                self.assertTrue(self._wait(lambda: hub.restarts >= 1))
+                self.assertIsNotNone(first.poll())
+            finally:
+                hub.stop()
+
+    def test_startup_refuses_a_missing_screen_and_a_switch_without_lan(self):
+        one = [{"screen": 0, "id": 1, "origin": (0, 0), "size": (1512, 982)}]
+        with unittest.mock.patch.object(switchdisplay, "mac_displays", return_value=one), \
+                unittest.mock.patch("sys.argv", ["switchdisplay", "--preset", "mac-extended"]):
+            with self.assertRaises(SystemExit) as stop:
+                switchdisplay.main()
+            self.assertIn("screen 1 does not exist", str(stop.exception))
+            self.assertIn("mac-mirror", str(stop.exception))
+        with unittest.mock.patch.object(switchdisplay, "_lan_ip", return_value="127.0.0.1"), \
+                unittest.mock.patch("sys.argv", ["switchdisplay", "--switch"]):
+            with self.assertRaises(SystemExit) as stop:
+                switchdisplay.main()
+            self.assertIn("no LAN address", str(stop.exception))
 
     def test_websocket_pong_is_ignored(self):
         pong = bytes([0x8A, 0x80]) + b"abcd"

@@ -178,11 +178,13 @@ VIEWER_HTML = b"""<!doctype html>
   function mjpegFallback() {
     if (window.__mode === 'mjpeg') return;
     window.__mode = 'mjpeg';
-    var img = document.createElement('img'), stall, last = new Date().getTime();
+    var img = document.createElement('img'), stall;
     mediaEl = img;
-    function restart() { img.src = '/mjpeg?' + (new Date().getTime());
-      window.clearTimeout(stall); stall = window.setTimeout(restart, 10000); }
-    img.onload = function () { frames++; window.__frames++; last = new Date().getTime(); fit(); };
+    // Reconnect only after 10 s without a frame: the server repeats the last
+    // frame every 3 s, so a healthy stream keeps pushing this timer back.
+    function arm() { window.clearTimeout(stall); stall = window.setTimeout(restart, 10000); }
+    function restart() { img.src = '/mjpeg?' + (new Date().getTime()); arm(); }
+    img.onload = function () { frames++; window.__frames++; arm(); fit(); };
     img.onerror = restart; restart(); document.getElementById('wrap').appendChild(img);
     canvas.style.display = 'none';
   }
@@ -479,22 +481,24 @@ VIEWER_HTML = b"""<!doctype html>
                'btn-minus', 'btn-plus', 'btn-lstick', 'btn-rstick', 'up', 'down', 'left', 'right'];
     var padHeld = {};
     var STICK_DEAD = 0.15, STICK_SPEED = 900;  // full tilt: points per second on the Mac
-    var moveX = 0, moveY = 0, lastPoll = new Date().getTime();
-    var pointerStick = function (rx, ry) {
-      var now = new Date().getTime(), dt = Math.min(now - lastPoll, 100) / 1000, mag, dx, dy;
-      lastPoll = now;
-      if (kbOpen) { moveX = 0; moveY = 0; return; }
+    var sticks = {};  // per gamepad, so a second pad at rest can't cancel the first
+    var pointerStick = function (pad, rx, ry) {
+      var now = new Date().getTime(), mag, dx, dy, dt;
+      var st = sticks[pad] || (sticks[pad] = {x: 0, y: 0, t: now});
+      dt = Math.min(now - st.t, 100) / 1000;
+      st.t = now;
+      if (kbOpen) { st.x = 0; st.y = 0; return; }
       if (typeof rx !== 'number' || typeof ry !== 'number') { return; }
       mag = Math.sqrt(rx * rx + ry * ry);
-      if (mag < STICK_DEAD) { moveX = 0; moveY = 0; return; }
+      if (mag < STICK_DEAD) { st.x = 0; st.y = 0; return; }
       probe['right-stick'] = (probe['right-stick'] || 0) + 1;
       // squared response: small tilts aim precisely, full tilt crosses the screen.
       // Fractions carry over so a slow tilt still moves.
-      moveX += rx * mag * STICK_SPEED * dt;
-      moveY += ry * mag * STICK_SPEED * dt;
-      dx = moveX < 0 ? Math.ceil(moveX) : Math.floor(moveX);
-      dy = moveY < 0 ? Math.ceil(moveY) : Math.floor(moveY);
-      moveX -= dx; moveY -= dy;
+      st.x += rx * mag * STICK_SPEED * dt;
+      st.y += ry * mag * STICK_SPEED * dt;
+      dx = st.x < 0 ? Math.ceil(st.x) : Math.floor(st.x);
+      dy = st.y < 0 ? Math.ceil(st.y) : Math.floor(st.y);
+      st.x -= dx; st.y -= dy;
       if ((dx || dy) && inReady) { inWs.send('m:' + dx + ',' + dy); }
     };
     var padSet = function (src, name, on) {
@@ -519,7 +523,7 @@ VIEWER_HTML = b"""<!doctype html>
           ax = p.axes || [];
           padSet('stick' + i, 'left', ax[0] < -0.5); padSet('stick' + i, 'right', ax[0] > 0.5);
           padSet('stick' + i, 'up', ax[1] < -0.5); padSet('stick' + i, 'down', ax[1] > 0.5);
-          pointerStick(ax[2], ax[3]);
+          pointerStick(i, ax[2], ax[3]);
         }
       }, 33);
     }
@@ -746,6 +750,9 @@ ACCESSIBILITY_HELP = ("grant Accessibility to the app that launched the server: 
                       "then quit and reopen it")
 
 
+_ax_checked: list = [float("-inf"), None]  # when, and what AXIsProcessTrusted said
+
+
 def accessibility_trusted(prompt: bool = False) -> bool | None:
     """macOS: may this process post input events? None off macOS.
 
@@ -755,13 +762,19 @@ def accessibility_trusted(prompt: bool = False) -> bool | None:
     """
     if sys.platform != "darwin":
         return None
+    now = time.monotonic()
+    if not prompt and now - _ax_checked[0] < 1.0:
+        # asked on every key press and pointer move (30 a second): one real
+        # check a second is enough, and a newly granted permission still shows up
+        return _ax_checked[1]
     import ctypes
     try:
         ax = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/"
                          "ApplicationServices")
         if not prompt:
             ax.AXIsProcessTrusted.restype = ctypes.c_bool
-            return bool(ax.AXIsProcessTrusted())
+            _ax_checked[:] = now, bool(ax.AXIsProcessTrusted())
+            return _ax_checked[1]
         cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
         cf.CFDictionaryCreate.restype = ctypes.c_void_p
         cf.CFDictionaryCreate.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
@@ -1030,7 +1043,8 @@ class KeyInjector:
                  poster=None, button_poster=None, mover=None,
                  bounds: tuple[int, int, int, int] | None = None,
                  text_enabled: bool = False, text_poster=None, focus_check=None,
-                 focus_delay_s: float = 0.25):
+                 focus_delay_s: float = 0.25, geometry: "Clicker | None" = None):
+        self.geometry = geometry  # the pointer's bounds follow this Clicker's display
         self.keymap = keymap
         self.dry_run = dry_run
         self.hold_s = hold_s
@@ -1120,6 +1134,9 @@ class KeyInjector:
         dy = max(-self.MAX_MOVE, min(self.MAX_MOVE, dy))
         with self._lock:
             self.stats["moves"] += 1
+            if self.geometry and self.geometry.display_size:
+                self.geometry.refresh()
+                self.bounds = (*self.geometry.origin, *self.geometry.display_size)
             if self.dry_run:
                 if self.bounds:  # a pretend pointer, so the viewer's marker can be tried safely
                     bx, by, bw, bh = self.bounds
@@ -1285,10 +1302,14 @@ class Clicker:
     def __init__(self, secret: str, display_size: tuple[int, int] | None,
                  origin: tuple[int, int], dry_run: bool,
                  max_per_window: int = 10, window_s: float = 3.0,
-                 min_gap_s: float = 0.08):
+                 min_gap_s: float = 0.08, screen: int | None = None,
+                 follow_origin: bool = True):
         self.secret = secret
         self.display_size = display_size      # Mac display points; None -> use frame size
         self.origin = origin                  # display origin in global screen coords
+        self.screen = screen                  # auto-detected "Capture screen N", else None
+        self.follow_origin = follow_origin    # False when --click-display-origin set it
+        self._refreshed = time.monotonic()
         self.dry_run = dry_run
         self.max_per_window = max_per_window
         self.window_s = window_s
@@ -1299,6 +1320,26 @@ class Clicker:
         self._lock = threading.Lock()
         self._by_ip: dict[str, list[float]] = {}
         self._last_time: dict[str, float] = {}  # per client: one device can't throttle another
+
+    def refresh(self) -> None:
+        """Re-read an auto-detected display's size and origin, at most once a second.
+
+        A resolution change or a rearranged display would otherwise leave taps
+        and the pointer mapped to the geometry the server started with.
+        """
+        now = time.monotonic()
+        if self.screen is None or now - self._refreshed < 1.0:
+            return
+        self._refreshed = now
+        match = [d for d in mac_displays() if d["screen"] == self.screen]
+        if not match:
+            return
+        size = match[0]["size"]
+        origin = match[0]["origin"] if self.follow_origin else self.origin
+        if (size, origin) != (self.display_size, self.origin):
+            self.display_size, self.origin = size, origin
+            print(f"[click] screen {self.screen} is now {size[0]}x{size[1]} points at "
+                  f"{origin[0]},{origin[1]}", flush=True)
 
     def check_secret(self, candidate: str) -> bool:
         return hmac.compare_digest(str(candidate).encode(), self.secret.encode())
@@ -1337,6 +1378,7 @@ class Clicker:
 
         # frame pixels -> normalised -> display points (scale-invariant, so the
         # ffmpeg downscale and the page letterbox both cancel out)
+        self.refresh()
         nx, ny = x / fw, y / fh
         dw, dh = self.display_size or (fw, fh)
         ox, oy = self.origin
@@ -1482,8 +1524,10 @@ class Hub:
         self.started = time.time()
         self.frame_id = 0
         self.no_frames_warn_s = 8.0
+        self.stall_s = 30.0      # a capture that sent frames, then none for this long, is stuck
         self._proc_frames = 0
         self._spawned = time.monotonic()
+        self._last_frame = self._spawned
         self._stopping = threading.Event()
         self._proc_lock = threading.Lock()
 
@@ -1501,7 +1545,7 @@ class Hub:
                                     stderr=subprocess.PIPE, start_new_session=True)
             self.proc = proc
             self._proc_frames = 0
-            self._spawned = time.monotonic()
+            self._spawned = self._last_frame = time.monotonic()
         threading.Thread(target=self._read_frames, args=(proc,), daemon=True).start()
         threading.Thread(target=self._read_stderr, args=(proc,), daemon=True).start()
 
@@ -1540,11 +1584,24 @@ class Hub:
                       "it again.", flush=True)
                 if self.restart_stalled:
                     self._terminate(proc)
+            # An unchanged screen still yields frames (they are counted, then dropped
+            # as duplicates), so a running capture that goes quiet has stalled.
+            if self.restart_stalled and self._proc_frames \
+                    and now - self._last_frame > self.stall_s:
+                self._last_frame = now
+                print(f"[src ] WARNING: no frames for {self.stall_s:g} s from a capture that "
+                      "was working; restarting it", flush=True)
+                self._terminate(proc)
 
     def _read_stderr(self, proc: subprocess.Popen) -> None:
-        for line in proc.stderr:
-            self.stderr_tail.append(line.decode("utf-8", "replace").rstrip())
-            del self.stderr_tail[:-20]
+        try:
+            for line in proc.stderr:
+                self.stderr_tail.append(line.decode("utf-8", "replace").rstrip())
+                del self.stderr_tail[:-20]
+        except ValueError:  # closed under us
+            pass
+        finally:
+            proc.stderr.close()
 
     def _read_frames(self, proc: subprocess.Popen) -> None:
         """Split a concatenated JPEG stream at SOI/EOI markers.
@@ -1554,15 +1611,18 @@ class Hub:
         memory without bound.
         """
         splitter = JpegStreamSplitter()
-        while True:
-            # read1 returns whatever is available: read(n) would block until the
-            # full 64 KB fills, which throttles a 20 fps stream to a few fps
-            # and makes the newest-frame-only client queue drop frames.
-            chunk = proc.stdout.read1(65536)
-            if not chunk:
-                break
-            for frame in splitter.feed(chunk):
-                self._publish(frame)
+        try:
+            while True:
+                # read1 returns whatever is available: read(n) would block until the
+                # full 64 KB fills, which throttles a 20 fps stream to a few fps
+                # and makes the newest-frame-only client queue drop frames.
+                chunk = proc.stdout.read1(65536)
+                if not chunk:
+                    break
+                for frame in splitter.feed(chunk):
+                    self._publish(frame)
+        finally:
+            proc.stdout.close()
 
     def _publish(self, frame: bytes) -> None:
         if len(frame) < 64:  # truncated tail: not a frame
@@ -1570,6 +1630,7 @@ class Hub:
         with self.lock:
             self.frames += 1
             self._proc_frames += 1
+            self._last_frame = time.monotonic()
             if frame == self.latest:
                 # an unchanged screen encodes to the same bytes: sending it again
                 # would only make the Switch decode and draw the same picture
@@ -1811,6 +1872,9 @@ class WSClientParser:
         return events
 
 
+INPUT_IDLE_S = 15.0  # /input: ping after this long without a message; three in a row close it
+
+
 def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                  allowed_hosts: set[str] | None = None,
                  click_allow: set[str] | None = None,
@@ -1865,6 +1929,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
             except ValueError:
                 length = 0
             if length <= 0 or length > 4096:
+                self.close_connection = True  # the unread body must not be parsed as a request
                 self._json(413, {"error": "bad body size"})
                 return
             try:
@@ -2063,9 +2128,22 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                     ws_send_frame(self.connection, payload, opcode)
             with injector._lock:
                 injector.connections += 1
+            # A viewer with nothing held sends nothing, so silence alone proves
+            # nothing: ping it, and give up once the pings go unanswered too. A
+            # Switch that dropped off Wi-Fi would otherwise hold this thread forever.
+            self.connection.settimeout(INPUT_IDLE_S)
+            silent = 0
             try:
                 while True:
-                    data = self.connection.recv(4096)
+                    try:
+                        data = self.connection.recv(4096)
+                    except socket.timeout:
+                        silent += 1
+                        if silent > 2:
+                            return
+                        send(b"", 0x9)
+                        continue
+                    silent = 0
                     if not data:
                         return
                     for kind, payload in parser.feed(data):
@@ -2392,7 +2470,12 @@ def main() -> int:
     if args.list_displays:
         return list_displays()
     lan_ip = _lan_ip()
+    bind_given = args.bind is not None
     if args.switch:
+        if lan_ip.startswith("127.") and not (args.bind and args.dns_answer):
+            raise SystemExit("--switch: this machine has no LAN address, so a Switch could not "
+                             "reach it. Join the Switch's Wi-Fi network, or name the address "
+                             "with --bind IP --dns-answer IP.")
         args.bind = args.bind or lan_ip
         args.port = 80 if args.port is None else args.port
         args.dns_port = 53 if args.dns_port is None else args.dns_port
@@ -2418,6 +2501,17 @@ def main() -> int:
     if args.print_source:
         print(shlex.join(cmd))
         return 0
+    if not args.source and args.preset in ("mac-mirror", "mac-extended"):
+        # otherwise ffmpeg fails on "Capture screen N" and is restarted forever
+        displays, wanted = mac_displays(), _mac_screen(args)
+        if displays and not 0 <= wanted < len(displays):
+            raise SystemExit(
+                f"screen {wanted} does not exist: this Mac has {len(displays)} active "
+                f"display{'s' if len(displays) != 1 else ''} (screen 0"
+                f"{'..%d' % (len(displays) - 1) if len(displays) > 1 else ''}). "
+                + ("--preset mac-extended captures a second display; with one display use "
+                   "--preset mac-mirror. " if args.screen is None else "")
+                + "See --list-displays.")
 
     from http.server import ThreadingHTTPServer
     import socketserver
@@ -2447,6 +2541,9 @@ def main() -> int:
             display_size=size,
             origin=origin or (0, 0),
             dry_run=args.click_dry_run,
+            # only geometry that was auto-detected follows later display changes
+            screen=screen if args.click_display_size is None and size else None,
+            follow_origin=args.click_display_origin is None,
         )
     injector = None
     if args.text and not args.keys:
@@ -2457,7 +2554,7 @@ def main() -> int:
         injector = KeyInjector(parse_keymap(args.keymap), dry_run=args.click_dry_run,
                                bounds=(*clicker.origin, *clicker.display_size)
                                if clicker.display_size else None,
-                               text_enabled=args.text)
+                               text_enabled=args.text, geometry=clicker)
     if clicker and args.bind == "0.0.0.0":
         args.bind = lan_ip
         print(f"[http] click enabled; binding to LAN IP {lan_ip} instead of 0.0.0.0", flush=True)
@@ -2510,6 +2607,13 @@ def main() -> int:
                          daemon=True).start()
     shown = args.bind
     print(f"[http] http://{shown}:{args.port}/  (viewer, /ws, /mjpeg, /click, /health)", flush=True)
+    if shown.startswith("127.") and not bind_given:
+        print("[http] warning: no LAN address was found, so only this machine can open that. "
+              "Restart once the network is up, or pass --bind IP.", flush=True)
+    elif args.switch and not bind_given:
+        print(f"[http] {lan_ip} was picked as this machine's LAN address. If the Switch is on "
+              "another network (a VPN can take over the default route), pass --bind IP "
+              "--dns-answer IP.", flush=True)
     print(f"[src ] {shlex.join(cmd)}", flush=True)
     if clicker:
         size = clicker.display_size or "frame size"
