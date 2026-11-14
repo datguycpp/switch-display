@@ -28,6 +28,7 @@ import functools
 import hashlib
 import hmac
 import json
+import math
 import os
 import queue
 import re
@@ -108,6 +109,7 @@ VIEWER_HTML = b"""<!doctype html>
   var INPUT_ON = __INPUT_ON__;
   var TEXT_ON = __TEXT_ON__;
   var fill = __FILL__;
+  var TILES = __TILES__;  // [cols, rows] with --tiles, else null
   var hud = document.getElementById('hud');
   var canvas = document.getElementById('c');
   var ctx = canvas.getContext('2d');
@@ -168,25 +170,96 @@ VIEWER_HTML = b"""<!doctype html>
   }
   window.setInterval(hudUpdate, 500);
 
+  // ?mode= picks how frames arrive and are drawn, for comparing on a device:
+  //   canvas  drawn on the canvas; the next frame is sent when this one is drawn (default)
+  //   push    drawn on the canvas; the server sends frames as fast as the link takes them
+  //   img     swapped <img> elements, pushed    pull  swapped <img> elements, on request
+  //   mjpeg   one multipart <img> stream, no WebSocket
+  // With --tiles the server sends changed tiles only, which needs the canvas.
   function queryMode() {
     var q = location.search.substring(1).split('&'), i, p;
     for (i = 0; i < q.length; i++) { p = q[i].split('=');
-      if (p[0] === 'mode' && /^(canvas|img|mjpeg|pull)$/.test(p[1])) return p[1]; }
+      if (p[0] === 'mode' && /^(canvas|push|img|mjpeg|pull)$/.test(p[1])) return p[1]; }
     return 'canvas';
   }
-  var wantedMode = queryMode();
+  var wantedMode = TILES ? 'tiles' : queryMode();
   function mjpegFallback() {
     if (window.__mode === 'mjpeg') return;
+    if (TILES) { window.__mode = 'tiles need WebSocket'; return; }
     window.__mode = 'mjpeg';
     var img = document.createElement('img'), stall;
     mediaEl = img;
     // Reconnect only after 10 s without a frame: the server repeats the last
     // frame every 3 s, so a healthy stream keeps pushing this timer back.
-    function arm() { window.clearTimeout(stall); stall = window.setTimeout(restart, 10000); }
-    function restart() { img.src = '/mjpeg?' + (new Date().getTime()); arm(); }
-    img.onload = function () { frames++; window.__frames++; arm(); fit(); };
-    img.onerror = restart; restart(); document.getElementById('wrap').appendChild(img);
+    function arm(ms) { window.clearTimeout(stall); stall = window.setTimeout(restart, ms); }
+    function restart() { img.src = '/mjpeg?' + (new Date().getTime()); arm(10000); }
+    img.onload = function () { frames++; window.__frames++; arm(10000); fit(); };
+    img.onerror = function () { arm(1000); };  // not at once: a refusing server would be hammered
+    restart(); document.getElementById('wrap').appendChild(img);
     canvas.style.display = 'none';
+  }
+
+  // Frames wait here to be decoded, one at a time. Whole frames: only the newest is
+  // kept. Tiles: every tile of a batch is kept, since each covers a different area.
+  var waiting = [];
+  var asImg = wantedMode === 'img' || wantedMode === 'pull';
+  var onRequest = wantedMode !== 'img' && wantedMode !== 'push';
+  function askNext() {
+    // On the socket open now: a decode can outlive the connection it came from.
+    var cur = window.__ws;
+    if (onRequest && cur && cur.readyState === 1) { cur.send('n'); }
+  }
+  function decodeNext() {
+    window.__decoding = false;
+    if (waiting.length) { decode(waiting.shift()); }
+  }
+  function drawn(last) {
+    if (last) { frames++; window.__frames++; askNext(); }
+    decodeNext();
+  }
+  function decode(data) {
+    window.__decoding = true;
+    var tile = null, head;
+    if (TILES) {
+      head = new Uint8Array(data, 0, 3);  // magic, tile index, tiles left in the batch
+      tile = {idx: head[1], more: head[2]};
+      data = data.slice(3);
+    }
+    var blob = new Blob([data], { type: 'image/jpeg' });
+    var u = window.URL.createObjectURL(blob);
+    var img = new Image();
+    img.onload = function () {
+      var resized, w, h;
+      if (asImg) {
+        // swap <img> elements; the previous one and its blob URL are freed
+        var old = mediaEl;
+        img.__url = u;
+        document.getElementById('wrap').appendChild(img);
+        canvas.style.display = 'none';
+        mediaEl = img; fit();
+        if (old && old !== canvas && old !== img) {
+          if (old.__url) window.URL.revokeObjectURL(old.__url);
+          if (old.parentNode) old.parentNode.removeChild(old);
+        }
+      } else {
+        w = tile ? img.width * TILES[0] : img.width;
+        h = tile ? img.height * TILES[1] : img.height;
+        resized = canvas.width !== w || canvas.height !== h;
+        if (resized) { canvas.width = w; canvas.height = h; }
+        if (tile) {
+          ctx.drawImage(img, (tile.idx % TILES[0]) * img.width,
+                        Math.floor(tile.idx / TILES[0]) * img.height);
+        } else { ctx.drawImage(img, 0, 0); }
+        window.URL.revokeObjectURL(u);
+        if (resized || mediaEl !== canvas) { mediaEl = canvas; fit(); }
+      }
+      drawn(!tile || !tile.more);
+    };
+    img.onerror = function () {
+      window.URL.revokeObjectURL(u);
+      drawn(!tile || !tile.more);
+    };
+    img.src = u;
   }
   if (wantedMode === 'mjpeg' || !window.WebSocket) { mjpegFallback(); } else {
     (function connect() {
@@ -195,59 +268,22 @@ VIEWER_HTML = b"""<!doctype html>
       var attempts = window.__wsAttempts || 0;
       window.__wsAttempts = attempts + 1;
       try { ws = new WebSocket(url); } catch (e) { mjpegFallback(); return; }
-       window.__mode = wantedMode === 'pull' ? 'pull' : wantedMode;
-       ws.binaryType = 'arraybuffer';
-       ws.onopen = function () { hud.textContent = window.__mode + ' open'; window.__ws = ws;
-         if (wantedMode === 'pull') ws.send('pull'); };
-       ws.onmessage = function (ev) {
-        if (!gotMessage) { gotMessage = true; window.__wsAttempts = 0; }
-        if (window.__decoding) {
-          window.__pending = ev.data;
-          return;
-        }
-        decode(ev.data);
+      window.__mode = wantedMode;
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = function () {
+        hud.textContent = window.__mode + ' open'; window.__ws = ws;
+        waiting = [];  // from the connection before; the server starts this one afresh
+        if (onRequest) { ws.send('pull'); }
       };
-      function done() {
-        if (wantedMode === 'pull' && ws.readyState === 1) ws.send('n');
-        window.__decoding = false;
-        if (window.__pending) { var next = window.__pending; window.__pending = null; decode(next); }
-      }
-      function decode(data) {
-        window.__decoding = true;
-        var blob = new Blob([data], { type: 'image/jpeg' });
-        var u = window.URL.createObjectURL(blob);
-        var img = new Image();
-        img.onload = function () {
-          if (wantedMode === 'img' || wantedMode === 'pull') {
-            // swap <img> elements; the previous one and its blob URL are freed
-            var old = mediaEl;
-            img.__url = u;
-            document.getElementById('wrap').appendChild(img);
-            canvas.style.display = 'none';
-            mediaEl = img; fit();
-            if (old && old !== canvas && old !== img) {
-              if (old.__url) window.URL.revokeObjectURL(old.__url);
-              if (old.parentNode) old.parentNode.removeChild(old);
-            }
-          } else {
-            var resized = canvas.width !== img.width || canvas.height !== img.height;
-            if (resized) { canvas.width = img.width; canvas.height = img.height; }
-            ctx.drawImage(img, 0, 0);
-            window.URL.revokeObjectURL(u);
-            if (resized || mediaEl !== canvas) { mediaEl = canvas; fit(); }
-          }
-          frames++;
-          window.__frames++;
-          done();
-        };
-        img.onerror = function () {
-          window.URL.revokeObjectURL(u);
-          done();
-        };
-        img.src = u;
-      }
-       ws.onclose = function () {
-        if (!gotMessage && attempts >= 3) { mjpegFallback(); return; }
+      ws.onmessage = function (ev) {
+        if (!gotMessage) { gotMessage = true; window.__wsAttempts = 0; }
+        if (typeof ev.data === 'string') { return; }
+        if (TILES) { waiting.push(ev.data); } else { waiting = [ev.data]; }
+        if (!window.__decoding) { decodeNext(); }
+      };
+      ws.onclose = function () {
+        // tiles have no MJPEG form, so there the socket is simply retried
+        if (!TILES && !gotMessage && attempts >= 3) { mjpegFallback(); return; }
         hud.textContent = 'reconnecting...';
         window.setTimeout(connect, 1000);
       };
@@ -636,7 +672,8 @@ VIEWER_HTML = b"""<!doctype html>
 
 
 def render_viewer(click_enabled: bool, secret: str, input_enabled: bool = False,
-                  text_enabled: bool = False, fill: str = "fit") -> bytes:
+                  text_enabled: bool = False, fill: str = "fit",
+                  tiles: tuple[int, int] | None = None) -> bytes:
     """Inject the click/input flags and secret into the static page (JS literals, JSON-escaped)."""
     literal = json.dumps(secret if click_enabled or input_enabled else "")
     literal = (literal.replace("<", "\\u003c").replace(">", "\\u003e")
@@ -646,6 +683,7 @@ def render_viewer(click_enabled: bool, secret: str, input_enabled: bool = False,
             .replace(b"__INPUT_ON__", b"true" if input_enabled else b"false")
             .replace(b"__TEXT_ON__", b"true" if input_enabled and text_enabled else b"false")
             .replace(b"__FILL__", json.dumps(fill).encode())
+            .replace(b"__TILES__", json.dumps(list(tiles) if tiles else None).encode())
             .replace(b"__CLICK_SECRET__", literal.encode()))
 
 
@@ -1509,9 +1547,17 @@ class Hub:
     when asked to, when it never produces a first frame.
     """
 
-    def __init__(self, cmd: list[str], restart_stalled: bool = False):
+    def __init__(self, cmd: list[str], restart_stalled: bool = False,
+                 tiles: tuple[int, int] | None = None):
         self.cmd = cmd
         self.restart_stalled = restart_stalled  # also restart when no first frame arrives
+        # Tile mode (--tiles CxR): the capture emits each picture as C*R JPEGs in row
+        # order. Only tiles whose bytes changed are kept as new, so a viewer is sent
+        # (and has to decode) just the parts of the screen that changed.
+        self.tiles = tiles
+        self.tile_latest: dict[int, tuple[bytes, int]] = {}  # index -> (jpeg, frame_id)
+        self.tile_updates = 0    # changed tiles, over all pictures
+        self._tile_pending: dict[int, bytes] = {}
         self.latest: bytes | None = None
         self.frame_size: tuple[int, int] | None = None
         self.lock = threading.Lock()
@@ -1611,6 +1657,7 @@ class Hub:
         memory without bound.
         """
         splitter = JpegStreamSplitter()
+        count = 0  # frames from this process: in tile mode, count % tiles is the tile
         try:
             while True:
                 # read1 returns whatever is available: read(n) would block until the
@@ -1620,7 +1667,11 @@ class Hub:
                 if not chunk:
                     break
                 for frame in splitter.feed(chunk):
-                    self._publish(frame)
+                    if self.tiles:
+                        self._publish_tile(frame, count % (self.tiles[0] * self.tiles[1]))
+                    else:
+                        self._publish(frame)
+                    count += 1
         finally:
             proc.stdout.close()
 
@@ -1643,10 +1694,47 @@ class Hub:
         for client in clients:
             client.offer(frame)
 
+    def _publish_tile(self, tile: bytes, index: int) -> None:
+        """One tile of a picture. Changes become visible together once the last tile
+        of the picture arrives, so a viewer never draws half of an update."""
+        cols, rows = self.tiles
+        with self.lock:
+            self._proc_frames += 1
+            self._last_frame = time.monotonic()
+            if index == 0:
+                self.frames += 1
+                self._tile_pending.clear()  # a picture cut short by a capture restart
+            if tile != self.tile_latest.get(index, (None, 0))[0]:
+                self._tile_pending[index] = tile
+            if index != cols * rows - 1:
+                return
+            if not self._tile_pending:
+                self.duplicates += 1
+                return
+            self.frame_id += 1
+            for i, data in self._tile_pending.items():
+                self.tile_latest[i] = (data, self.frame_id)
+            self.tile_updates += len(self._tile_pending)
+            self._tile_pending.clear()
+            size = jpeg_size(tile)
+            if size:
+                self.frame_size = (size[0] * cols, size[1] * rows)
+            clients = list(self.clients)
+        for client in clients:
+            client.wake()
+
+    def tiles_since(self, sent: dict[int, int]) -> list[tuple[int, bytes, int]]:
+        """Tiles newer than the versions a viewer already has, as (index, jpeg, version)."""
+        with self.lock:
+            return [(i, data, version) for i, (data, version) in sorted(self.tile_latest.items())
+                    if sent.get(i) != version]
+
     def add_client(self, ip: str = "", mode: str = "ws") -> "Client":
         client = Client(ip, mode)
         with self.lock:
             self.clients.add(client)
+            if self.tile_latest:
+                client.wake()
             # An unchanged screen publishes nothing: show it now. Under the lock, so a
             # frame published meanwhile is offered after this one and not replaced by it.
             if self.latest is not None:
@@ -1715,6 +1803,9 @@ class Client:
             self.queue.put_nowait(frame)
         except queue.Full:
             pass  # the consumer refilled it between the two calls; still fresh
+        self.wake()
+
+    def wake(self) -> None:
         try:
             self.wakeup_write.send(b"\0")
         except (BlockingIOError, OSError):
@@ -1741,7 +1832,7 @@ class Client:
             return
         if 0 <= value <= 240:  # also rejects nan
             self.render_fps = round(value, 1)
-            if mode in ("canvas", "img", "pull"):
+            if mode in ("canvas", "img", "pull", "push", "tiles"):
                 self.mode = mode
 
     def snapshot(self) -> dict:
@@ -1872,6 +1963,9 @@ class WSClientParser:
         return events
 
 
+# A tile message on /ws: this byte, the tile index, how many more tiles follow in
+# the batch, then the JPEG. A whole frame starts with the JPEG's own 0xFF instead.
+TILE_MAGIC = 0x54
 INPUT_IDLE_S = 15.0  # /input: ping after this long without a message; three in a row close it
 
 
@@ -1886,6 +1980,9 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # Nagle would hold the tail of each frame back until the previous segment
+        # is acknowledged; frames and input messages should leave at once.
+        disable_nagle_algorithm = True
 
         def log_message(self, fmt, *args):  # keep stdout clean
             pass
@@ -1967,7 +2064,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 page = render_viewer(allowed, clicker.secret if clicker else "",
                                      allowed and injector is not None,
                                      allowed and injector is not None and injector.text_enabled,
-                                     fill)
+                                     fill, hub.tiles)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(page)))
@@ -1984,6 +2081,8 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 body = json.dumps({
                     "frames": hub.frames,
                     "duplicate_frames": hub.duplicates,
+                    "tiles": hub.tiles,
+                    "tile_updates": hub.tile_updates if hub.tiles else None,
                     "source_restarts": hub.restarts,
                     "clients": len(hub.clients),
                     "viewers": hub.viewers(),
@@ -2004,6 +2103,8 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif path == "/mjpeg" and hub.tiles:
+                self.send_error(503, "the MJPEG stream is not available with --tiles")
             elif path == "/mjpeg":
                 self.send_response(200)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
@@ -2041,6 +2142,7 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 pull = False
                 requested = False
                 last_sent = -1
+                tiles_sent: dict[int, int] = {}  # tile index -> version this viewer has
                 last_ping = time.monotonic()
                 self.connection.setblocking(False)
                 try:
@@ -2077,7 +2179,21 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                                         elif pull and text == "n":
                                             requested = True
                         frame = None
-                        if pull:
+                        if hub.tiles:
+                            # Tiles need the pull flow: everything that changed since
+                            # the viewer's last request goes out as one batch, and the
+                            # viewer asks again once it has drawn the batch.
+                            batch = hub.tiles_since(tiles_sent) if requested else []
+                            for left, (index, data, version) in zip(
+                                    range(len(batch) - 1, -1, -1), batch):
+                                ws_send_frame(self.connection,
+                                              bytes((TILE_MAGIC, index, left)) + data)
+                                tiles_sent[index] = version
+                            if batch:
+                                requested = False
+                                client.sent += 1
+                                client.sent_bytes += sum(len(data) for _, data, _ in batch)
+                        elif pull:
                             if requested:
                                 with hub.lock:
                                     if hub.latest is not None and hub.frame_id != last_sent:
@@ -2256,27 +2372,45 @@ def _qv(quality: int) -> int:
     return max(1, min(31, 31 - int(quality * 0.31)))
 
 
-def _scale_filter(width: int, height: int, sharp: bool, stretch: bool = False) -> str:
+def _tile_step(tiles: tuple[int, int] | None) -> int:
+    """Frame sides must divide by this so every tile is the same, even-sided size."""
+    return math.lcm(2 * tiles[0], 2 * tiles[1]) if tiles else 2
+
+
+def _output_filters(gray: bool, tiles: tuple[int, int] | None) -> list[str]:
+    """Filters after scaling: gray drops colour (smaller, quicker to decode);
+    untile turns each picture into its tiles, one frame each, in row order."""
+    return (["format=gray"] if gray else []) + ([f"untile={tiles[0]}x{tiles[1]}"] if tiles else [])
+
+
+def _scale_filter(width: int, height: int, sharp: bool, stretch: bool = False,
+                  gray: bool = False, tiles: tuple[int, int] | None = None) -> str:
     """Scale to fit. sharp costs some CPU and data but keeps small text readable.
 
     stretch fills width x height exactly, so the viewer needn't enlarge the frame again.
     """
     flags, extra = ("lanczos", ",unsharp=3:3:0.5") if sharp else ("fast_bilinear", "")
-    shape = "" if stretch else "force_original_aspect_ratio=decrease:force_divisible_by=2:"
-    return f"scale={width}:{height}:{shape}flags={flags}{extra}"
+    shape = "" if stretch else ("force_original_aspect_ratio=decrease:"
+                                f"force_divisible_by={_tile_step(tiles)}:")
+    return ",".join([f"scale={width}:{height}:{shape}flags={flags}{extra}",
+                     *_output_filters(gray, tiles)])
 
 
-def default_capture_cmd(width: int, height: int, fps: int, quality: int) -> list[str]:
+def default_capture_cmd(width: int, height: int, fps: int, quality: int,
+                        gray: bool = False, tiles: tuple[int, int] | None = None) -> list[str]:
+    filters = _output_filters(gray, tiles)
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-re", "-f", "lavfi", "-i", f"testsrc=size={width}x{height}:rate={fps}",
+        *(["-vf", ",".join(filters), "-fps_mode", "passthrough"] if filters else []),
         "-pix_fmt", "yuvj420p", "-huffman", "optimal",
         "-c:v", "mjpeg", "-q:v", str(_qv(quality)), "-f", "mjpeg", "-",
     ]
 
 
 def mac_capture_cmd(index: int, width: int, height: int, fps: int, quality: int,
-                    sharp: bool = False, stretch: bool = False) -> list[str]:
+                    sharp: bool = False, stretch: bool = False, gray: bool = False,
+                    tiles: tuple[int, int] | None = None) -> list[str]:
     """macOS: AVFoundation screen device -> MJPEG on stdout.
 
     `index` is an AVFoundation video device name such as "Capture screen 0". The
@@ -2289,7 +2423,7 @@ def mac_capture_cmd(index: int, width: int, height: int, fps: int, quality: int,
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "avfoundation", "-framerate", str(fps), "-pixel_format", "nv12",
         "-capture_cursor", "1", "-i", f"{index}:none",
-        "-vf", _scale_filter(width, height, sharp, stretch),
+        "-vf", _scale_filter(width, height, sharp, stretch, gray, tiles),
         # passthrough: the default CFR mode duplicates AVFoundation frames to
         # hundreds of fps (measured ~680 fps for -framerate 15), flooding Wi-Fi
         "-fps_mode", "passthrough",
@@ -2299,11 +2433,13 @@ def mac_capture_cmd(index: int, width: int, height: int, fps: int, quality: int,
 
 
 def x11_capture_cmd(display: str, width: int, height: int, fps: int, quality: int,
-                    sharp: bool = False, stretch: bool = False) -> list[str]:
+                    sharp: bool = False, stretch: bool = False, gray: bool = False,
+                    tiles: tuple[int, int] | None = None) -> list[str]:
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "x11grab", "-framerate", str(fps), "-i", display,
-        "-vf", _scale_filter(width, height, sharp, stretch),
+        "-vf", _scale_filter(width, height, sharp, stretch, gray, tiles),
+        *(["-fps_mode", "passthrough"] if tiles else []),
         "-pix_fmt", "yuvj420p", "-huffman", "optimal",
         "-c:v", "mjpeg", "-q:v", str(_qv(quality)), "-f", "mjpeg", "-",
     ]
@@ -2325,24 +2461,27 @@ PROFILES = {"sharp": (1280, 720), "balanced": (960, 540), "low": (800, 450),
 def resolve_capture(args) -> list[str]:
     """Turn CLI flags into the capture argv (or a shell command)."""
     if args.source:
+        tiles = getattr(args, "tiles", None)
         values = {"{w}": str(args.width), "{h}": str(args.height), "{fps}": str(args.fps),
-                  "{q}": str(args.quality), "{qv}": str(_qv(args.quality))}
+                  "{q}": str(args.quality), "{qv}": str(_qv(args.quality)),
+                  "{tiles}": "%dx%d" % tiles if tiles else "1x1"}
         source = args.source
         for key, value in values.items():
             source = source.replace(key, value)
         return ["/bin/sh", "-c", source]
     preset = args.preset or "test"
     quality = args.quality
+    gray, tiles = getattr(args, "gray", False), getattr(args, "tiles", None)
     if preset == "test":
-        return default_capture_cmd(args.width, args.height, args.fps, quality)
+        return default_capture_cmd(args.width, args.height, args.fps, quality, gray, tiles)
     if preset in ("mac-mirror", "mac-extended"):
         return mac_capture_cmd(f"Capture screen {_mac_screen(args)}", args.width, args.height, args.fps, quality,
                                getattr(args, "profile", None) == "text",
-                               getattr(args, "fill", "fit") == "stretch")
+                               getattr(args, "fill", "fit") == "stretch", gray, tiles)
     if preset == "x11":
         return x11_capture_cmd(args.display, args.width, args.height, args.fps, quality,
                                getattr(args, "profile", None) == "text",
-                               getattr(args, "fill", "fit") == "stretch")
+                               getattr(args, "fill", "fit") == "stretch", gray, tiles)
     raise SystemExit(f"unknown preset: {preset}")
 
 
@@ -2380,6 +2519,13 @@ def _parse_size(text: str) -> tuple[int, int]:
     if min(value) <= 0:
         raise argparse.ArgumentTypeError("size must be positive")
     return value
+
+
+def _parse_grid(text: str) -> tuple[int, int]:
+    cols, rows = _parse_size(text)
+    if cols > 8 or rows > 8 or cols * rows < 2:
+        raise argparse.ArgumentTypeError("expected COLSxROWS from 2x1 to 8x8")
+    return cols, rows
 
 
 def _parse_xy(text: str) -> tuple[int, int]:
@@ -2429,6 +2575,14 @@ def main() -> int:
                     help="how the picture fills the Switch screen: fit keeps it all with black "
                          "bars, crop cuts the overflow, stretch changes its shape (default fit; "
                          "the viewer's fill button switches live)")
+    ap.add_argument("--tiles", type=_parse_grid, default=None, metavar="COLSxROWS",
+                    help="send the picture as a grid of tiles, e.g. 4x4, and only the tiles "
+                         "that changed: far less for the Switch to decode when most of the "
+                         "screen stays still (text, logs). No gain for video or games. Needs "
+                         "the WebSocket viewer (/mjpeg is off), and a custom --source must "
+                         "emit the tiles itself, e.g. with ffmpeg's untile={tiles}")
+    ap.add_argument("--gray", action="store_true",
+                    help="capture in greyscale: smaller frames that decode faster; for text")
     ap.add_argument("--dns-port", type=int, default=None,
                     help="also answer DNS A queries on this port (53 needs root)")
     ap.add_argument("--dns-answer", default=None, help="IP to answer with (default: LAN IP)")
@@ -2496,6 +2650,12 @@ def main() -> int:
         args.height = ph
     if args.fps is None:
         args.fps = pf
+    if args.tiles:
+        # every tile must come out the same, even-sided size
+        args.width -= args.width % (2 * args.tiles[0])
+        args.height -= args.height % (2 * args.tiles[1])
+        if min(args.width, args.height) <= 0:
+            raise SystemExit("--tiles: the frame is too small for that grid")
 
     cmd = resolve_capture(args)
     if args.print_source:
@@ -2575,7 +2735,7 @@ def main() -> int:
             raise SystemExit(_bind_help("DNS", dns_bind, args.dns_port, exc))
     # A preset that sends no first frame is stuck; a custom --source may just be slow
     # to start (a portal dialog, say), so that one is only restarted when it exits.
-    hub = Hub(cmd, restart_stalled=not args.source)
+    hub = Hub(cmd, restart_stalled=not args.source, tiles=args.tiles)
     # the Mac itself may always control: loopback, or its own LAN address
     gate = ControlGate(args.click_allow, local={lan_ip, args.bind} - {"0.0.0.0", "::"})
     try:
@@ -2615,6 +2775,9 @@ def main() -> int:
               "another network (a VPN can take over the default route), pass --bind IP "
               "--dns-answer IP.", flush=True)
     print(f"[src ] {shlex.join(cmd)}", flush=True)
+    if args.tiles:
+        print(f"[src ] tiles {args.tiles[0]}x{args.tiles[1]}: only changed tiles are sent "
+              "(WebSocket viewer only)", flush=True)
     if clicker:
         size = clicker.display_size or "frame size"
         if clicker.display_size is None:

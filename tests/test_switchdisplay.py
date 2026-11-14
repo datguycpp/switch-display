@@ -659,9 +659,9 @@ class Tests(unittest.TestCase):
         finally:
             hub.remove_client(client)
 
-    def _viewer_case(self, name):
+    def _viewer_case(self, name, tiles=None):
         """Run one tools/viewer_test.js case against the rendered viewer script."""
-        page = switchdisplay.render_viewer(True, "s", True, True).decode()
+        page = switchdisplay.render_viewer(True, "s", True, True, tiles=tiles).decode()
         script = page[page.index("<script>") + 8:page.index("</script>")]
         with tempfile.NamedTemporaryFile("w", suffix=".js") as out:
             out.write(script)
@@ -678,6 +678,100 @@ class Tests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "needs Node.js")
     def test_viewer_slow_stick_moves_pointer_beside_a_second_gamepad(self):
         self._viewer_case("twopads")
+
+    @unittest.skipUnless(shutil.which("node"), "needs Node.js")
+    def test_viewer_asks_for_each_frame_unless_told_to_push(self):
+        self._viewer_case("onrequest")
+
+    @unittest.skipUnless(shutil.which("node"), "needs Node.js")
+    def test_viewer_draws_tiles_in_place_and_asks_after_the_batch(self):
+        self._viewer_case("tiles", tiles=(4, 4))
+
+    def test_tile_and_gray_capture_commands(self):
+        vf = switchdisplay._scale_filter(960, 540, False, gray=True, tiles=(4, 3))
+        self.assertEqual(vf, "scale=960:540:force_original_aspect_ratio=decrease:"
+                             "force_divisible_by=24:flags=fast_bilinear,format=gray,untile=4x3")
+        self.assertIn("force_divisible_by=2:", switchdisplay._scale_filter(960, 540, False))
+        args = SimpleNamespace(source=None, preset="test", width=960, height=536, fps=20,
+                               quality=65, tiles=(4, 4), gray=False)
+        cmd = switchdisplay.resolve_capture(args)
+        self.assertEqual(cmd[cmd.index("-vf") + 1], "untile=4x4")
+        args.tiles = None
+        self.assertNotIn("-vf", switchdisplay.resolve_capture(args))
+        args.source, args.tiles = "cap -vf untile={tiles}", (2, 2)
+        self.assertEqual(switchdisplay.resolve_capture(args)[-1], "cap -vf untile=2x2")
+        self.assertEqual(switchdisplay._parse_grid("4x4"), (4, 4))
+        for bad in ("1x1", "9x2", "4"):
+            with self.assertRaises(Exception):
+                switchdisplay._parse_grid(bad)
+        self.assertIn(b"var TILES = [4, 4];", switchdisplay.render_viewer(False, "", tiles=(4, 4)))
+        self.assertIn(b"var TILES = null;", switchdisplay.render_viewer(False, ""))
+
+    def test_hub_keeps_only_changed_tiles_and_shows_a_picture_at_once(self):
+        hub = switchdisplay.Hub([], tiles=(2, 1))
+        tile = lambda tag: (b"\xff\xd8\xff\xc0\x00\x11\x08\x00\x10\x00\x20" + tag * 64 +
+                            b"\xff\xd9")           # SOF: 32 wide, 16 high
+        client = hub.add_client()
+        try:
+            hub._publish_tile(tile(b"a"), 0)
+            self.assertEqual(hub.tiles_since({}), [])      # half a picture is not shown
+            self.assertFalse(select.select([client.wakeup_fd], [], [], 0)[0])
+            hub._publish_tile(tile(b"b"), 1)
+            self.assertTrue(select.select([client.wakeup_fd], [], [], 0)[0])
+            client.drain_wakeup()
+            self.assertEqual(hub.tiles_since({}), [(0, tile(b"a"), 1), (1, tile(b"b"), 1)])
+            self.assertEqual(hub.frame_size, (64, 16))
+            hub._publish_tile(tile(b"a"), 0); hub._publish_tile(tile(b"b"), 1)   # still screen
+            self.assertFalse(select.select([client.wakeup_fd], [], [], 0)[0])
+            hub._publish_tile(tile(b"a"), 0); hub._publish_tile(tile(b"c"), 1)   # right half changed
+            self.assertEqual(hub.tiles_since({0: 1, 1: 1}), [(1, tile(b"c"), 2)])
+            self.assertEqual((hub.frames, hub.duplicates, hub.tile_updates), (3, 1, 3))
+        finally:
+            hub.remove_client(client)
+
+    def test_tile_stream_sends_changed_tiles_on_request(self):
+        hub = switchdisplay.Hub([], tiles=(2, 1))
+        tile = lambda tag: b"\xff\xd8" + tag * 64 + b"\xff\xd9"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), switchdisplay.make_handler(
+            hub, None, {"127.0.0.1"}))
+        self.assertTrue(server.RequestHandlerClass.disable_nagle_algorithm)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        def say(sock, text):
+            mask = b"\x01\x02\x03\x04"
+            sock.sendall(bytes([0x81, 0x80 | len(text)]) + mask +
+                         bytes(c ^ mask[i % 4] for i, c in enumerate(text)))
+
+        def message(sock):                                 # one unfragmented server frame
+            head = sock.recv(2, socket.MSG_WAITALL)
+            data = b""
+            while len(data) < head[1]:
+                data += sock.recv(head[1] - len(data))
+            return data
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port)
+            conn.request("GET", "/mjpeg")
+            self.assertEqual(conn.getresponse().status, 503)
+            conn.close()
+            hub._publish_tile(tile(b"a"), 0); hub._publish_tile(tile(b"b"), 1)
+            sock = socket.create_connection(("127.0.0.1", server.server_port))
+            sock.settimeout(5)
+            sock.sendall(b"GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+                         b"Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                         b"Sec-WebSocket-Version: 13\r\n\r\n")
+            self.assertIn(b"101", sock.recv(4096))
+            say(sock, b"pull")
+            magic = switchdisplay.TILE_MAGIC
+            self.assertEqual(message(sock), bytes((magic, 0, 1)) + tile(b"a"))
+            self.assertEqual(message(sock), bytes((magic, 1, 0)) + tile(b"b"))
+            hub._publish_tile(tile(b"a"), 0); hub._publish_tile(tile(b"c"), 1)
+            self.assertFalse(select.select([sock], [], [], 0.3)[0])   # not asked for yet
+            say(sock, b"n")
+            self.assertEqual(message(sock), bytes((magic, 1, 0)) + tile(b"c"))
+            self.assertEqual(hub.viewers()[0]["sent"], 2)  # two updates, not three tiles
+            sock.close()
+        finally:
+            server.shutdown(); server.server_close()
 
     def test_silent_input_socket_is_pinged_then_closed(self):
         inj = switchdisplay.KeyInjector({}, dry_run=True)

@@ -24,9 +24,10 @@ minimal: the host captures the screen to JPEG frames, pushes them over a
 binary WebSocket (with an MJPEG `<img>` fallback that needs nothing but image
 decoding), and the page draws each frame to canvas.
 
-Flow control is ACK-driven: the server holds only the newest frame per viewer
-and drops the rest, so a slow renderer degrades to lower fps instead of
-growing lag. A frame identical to the previous one is not sent at all, so an
+Flow control is on request: the viewer asks for the next frame when it has drawn
+the last one, and the server answers with the newest. A slow renderer therefore
+degrades to lower fps instead of growing lag, and no frame waits in a network
+buffer behind the one being drawn. A frame identical to the previous one is not sent at all, so an
 unchanged screen costs the Switch nothing. A tap on the page can optionally
 POST back as one left click, and `--keys`/`--text` add Joy-Con and keyboard
 input. All control sits behind a shared secret that only one device is given
@@ -126,11 +127,44 @@ frame identical to the previous one (measured on a still region of a Mac
 screen: 81 of 82 frames skipped). That holds for presets and custom `--source`
 commands alike, and connections stay open with keepalives meanwhile.
 
-The viewer supports `?mode=canvas` (default WebSocket canvas), `?mode=img`
-(WebSocket image), `?mode=mjpeg` (native multipart image), and `?mode=pull`
-(client-pull WebSocket flow control). For example:
-`http://host:8090/?mode=img` and `http://host:8090/?mode=pull`. The HUD shows
-the selected mode and measured render fps for A/B comparisons on the Switch.
+The viewer takes a `?mode=` for comparing on the Switch:
+
+| Mode | Drawn as | Frames arrive |
+|---|---|---|
+| `canvas` (default) | canvas | on request, after the last one is drawn |
+| `push` | canvas | as fast as the link takes them (the default before) |
+| `img` | swapped `<img>` elements | pushed |
+| `pull` | swapped `<img>` elements | on request |
+| `mjpeg` | one multipart `<img>` | pushed, no WebSocket |
+
+For example `http://host:8090/?mode=img`. The HUD shows the selected mode and
+measured render fps, and `/health` `viewers` records both per device.
+
+### Sending less: `--tiles` and `--gray`
+
+`--tiles COLSxROWS` (for example `--tiles 4x4`) cuts the picture into a grid and
+sends only the tiles that changed. ffmpeg's `untile` filter does the cutting, and
+the server applies the same "identical bytes are not sent" rule per tile. When most
+of the screen stays still (text, logs, a dashboard) the Switch decodes a fraction
+of the pixels per update; a blinking cursor costs one tile instead of the screen.
+On the moving test pattern, a 4×4 grid sent 5.5 KB per update against 12.9 KB for whole
+frames. Things to know:
+
+* No gain for video or games, where every tile changes: that costs one decode
+  per tile instead of one per frame.
+* It needs the WebSocket viewer. `/mjpeg` answers 503 and `?mode=` is ignored.
+* The frame is sized so that every tile is identical and even-sided, which can
+  change the height by a few pixels (960×540 becomes 960×536 with 4×4).
+* A custom `--source` must emit the tiles itself, one JPEG each in row order;
+  `{tiles}` expands to the grid, as in `-vf untile={tiles}`.
+* `/health` reports `tiles` and `tile_updates`, and a viewer's `kb_per_frame` is
+  then the size of one update.
+
+`--gray` captures in greyscale. Frames came out about 40% smaller on the test
+pattern and have no colour detail to decode; meant for text.
+
+Whether either is faster on a real Switch has not been measured: compare
+`render_fps` in `/health` with and without.
 
 `--fill fit|crop|stretch` sets how a picture that isn't 16:9 fills the screen, and
 the viewer's **fill** button switches live (see MAC-SETUP.md).
@@ -273,7 +307,7 @@ the page served at that hostname keeps it open in practice.
 ## 5. Tests
 
 ```bash
-python3 -m unittest discover -s tests     # stdlib only, about 15 s
+python3 -m unittest discover -s tests     # stdlib only, about 15 s; viewer tests need Node.js
 tools/check_viewer_es5.sh                  # parses the viewer script as strict ES5 (needs Node.js)
 ```
 

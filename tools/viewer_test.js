@@ -5,12 +5,15 @@
 var fs = require('fs'), vm = require('vm'), assert = require('assert');
 
 function browser(search) {
-  var now = 0, timers = [], env = {sockets: [], created: [], pads: []};
+  var now = 0, timers = [], env = {sockets: [], created: [], pads: [], images: [], draws: []};
   function element(tag) {
     return {
       tag: tag, style: {}, className: '', value: '',
       addEventListener: function () {}, appendChild: function (c) { c.parentNode = this; },
-      removeChild: function () {}, getContext: function () { return {drawImage: function () {}}; },
+      removeChild: function () {},
+      getContext: function () {
+        return {drawImage: function (img, x, y) { env.draws.push([x, y]); }};
+      },
       getAttribute: function () { return null; }, getElementsByTagName: function () { return []; },
       getBoundingClientRect: function () { return {left: 0, top: 0, width: 100, height: 100}; },
       focus: function () {}, blur: function () {}
@@ -39,7 +42,9 @@ function browser(search) {
     },
     navigator: {getGamepads: function () { return env.pads; }},
     location: {protocol: 'http:', host: 'mac', search: search},
-    XMLHttpRequest: function () {}, Blob: function () {}, Image: function () {}
+    XMLHttpRequest: function () {}, Blob: function () {},
+    // decoding is up to the test: it calls onload on env.images entries
+    Image: function () { this.width = 240; this.height = 134; env.images.push(this); }
   };
   env.advance = function (ms) {  // run due timers in time order, then stop the clock at now + ms
     var end = now + ms, next, i;
@@ -87,6 +92,61 @@ var cases = {
     input.sent.forEach(function (m) { if (m.indexOf('m:') === 0) { moved += parseInt(m.substring(2), 10); } });
     assert.ok(moved >= 15 && moved <= 30, 'pointer moved ' + moved + ' px in 1 s, expected about 23');
   }
+};
+
+function frame() { return new Uint8Array([0xFF, 0xD8, 0xFF, 0xD9]).buffer; }
+function tile(index, more) { return new Uint8Array([0x54, index, more, 0xFF, 0xD8, 0xFF, 0xD9]).buffer; }
+function stream(env) { return env.sockets.filter(function (s) { return /\/ws$/.test(s.url); }); }
+
+// The default mode asks for each frame, so a slow device never has frames queued
+// behind the one it is drawing; ?mode=push keeps the old behaviour.
+cases.onrequest = function (script) {
+  var env = browser(''), ws, second;
+  vm.runInNewContext(script, env.context);
+  ws = stream(env)[0];
+  ws.onopen();
+  assert.deepStrictEqual(ws.sent, ['pull']);
+  ws.onmessage({data: frame()});
+  ws.onmessage({data: frame()});  // arrives while the first is still decoding
+  assert.strictEqual(env.images.length, 1, 'one decode at a time');
+  env.images[0].onload();
+  assert.deepStrictEqual(ws.sent, ['pull', 'n']);
+  // the socket drops while a frame is decoding; the request must go to the new one
+  ws.readyState = 3; ws.onclose();
+  env.advance(1000);
+  second = stream(env)[1];
+  second.onopen();
+  env.images[1].onload();
+  assert.deepStrictEqual(second.sent, ['pull', 'n']);
+  assert.deepStrictEqual(ws.sent, ['pull', 'n']);
+
+  env = browser('?mode=push');
+  vm.runInNewContext(script, env.context);
+  ws = stream(env)[0];
+  ws.onopen();
+  ws.onmessage({data: frame()});
+  env.images[0].onload();
+  assert.deepStrictEqual(ws.sent, [], 'push mode never asks');
+};
+// Tiles are drawn at their place in the grid and the next batch is requested
+// only when the whole batch is on the canvas. Run with a 4x4 grid.
+cases.tiles = function (script) {
+  var env = browser('?mode=img'), ws, canvas;  // tiles ignore ?mode=
+  vm.runInNewContext(script, env.context);
+  ws = stream(env)[0];
+  ws.onopen();
+  assert.deepStrictEqual(ws.sent, ['pull']);
+  ws.onmessage({data: tile(1, 2)});
+  ws.onmessage({data: tile(6, 1)});
+  ws.onmessage({data: tile(15, 0)});
+  env.images[0].onload();
+  env.images[1].onerror();  // a tile that fails to decode must not stall the batch
+  assert.deepStrictEqual(ws.sent, ['pull'], 'batch not finished');
+  env.images[2].onload();
+  assert.deepStrictEqual(ws.sent, ['pull', 'n']);
+  assert.deepStrictEqual(env.draws, [[240, 0], [720, 402]]);
+  canvas = env.context.document.getElementById('c');
+  assert.deepStrictEqual([canvas.width, canvas.height], [960, 536]);
 };
 
 cases[process.argv[2]](fs.readFileSync(process.argv[3], 'utf8'));
