@@ -221,7 +221,8 @@ for handheld mode). Only keys and mouse buttons in the keymap can be pressed,
 Command is not mappable, and the pointer stays on the captured screen. Held inputs are re-sent every 500 ms, and any key not refreshed for
 1.5 s, or whose socket closes, is released, so a dropped link can't leave W
 held down. Which Joy-Con buttons the Switch's browser passes to a page is not
-documented. The HUD and `/health` `input.seen`/`input.probe` show what arrives, and the
+documented. The HUD and `/health` `input.seen`/`input.probe` (shown only to the Mac
+itself and the controlling device) show what arrives, and the
 server log names unmapped inputs (see MAC-SETUP.md, "Joy-Con controls").
 
 `--text` (with `--keys`) adds the Switch's on-screen keyboard: a text box opens on

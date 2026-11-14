@@ -1373,26 +1373,91 @@ class JpegStreamSplitter:
     def __init__(self, max_buffer: int = 8 * 1024 * 1024):
         self.max_buffer = max_buffer
         self.buf = bytearray()
+        self._pos = 0          # scan position inside the current frame; 0 = no SOI yet
+        self._mode = "header"
 
     def feed(self, chunk: bytes):
         self.buf.extend(chunk)
         if len(self.buf) > self.max_buffer:
             del self.buf[:]
+            self._pos = 0
             return
         while True:
-            start = self.buf.find(b"\xff\xd8")
-            if start < 0:
-                if len(self.buf) > 1:
-                    del self.buf[:-1]
-                return
-            if start:
-                del self.buf[:start]
-            end = self.buf.find(b"\xff\xd9", 2)
+            if not self._pos:
+                start = self.buf.find(b"\xff\xd8")
+                if start < 0:
+                    if len(self.buf) > 1:
+                        del self.buf[:-1]
+                    return
+                if start:
+                    del self.buf[:start]
+                self._pos, self._mode = 2, "header"
+            end = self._find_end()
             if end < 0:
                 return
-            frame = bytes(self.buf[:end + 2])
-            del self.buf[:end + 2]
+            frame = bytes(self.buf[:end])
+            del self.buf[:end]
+            self._pos = 0
             yield frame
+
+    def _find_end(self) -> int:
+        """Index just past the current frame's EOI, or -1 until more data arrives.
+
+        Header segments are skipped by their length, so an FF D9 inside one (an
+        EXIF thumbnail, a comment) does not end the frame. Data that is not laid
+        out as JPEG segments falls back to the first FF D9.
+        """
+        buf, n = self.buf, len(self.buf)
+        while True:
+            pos = self._pos
+            if self._mode == "raw":
+                end = buf.find(b"\xff\xd9", pos)
+                if end < 0:
+                    self._pos = max(pos, n - 1)
+                    return -1
+                return end + 2
+            if self._mode == "scan":  # entropy-coded data: look for the next real marker
+                pos = buf.find(b"\xff", pos)
+                if pos < 0 or pos + 1 >= n:
+                    self._pos = n if pos < 0 else pos
+                    return -1
+                marker = buf[pos + 1]
+                if marker == 0x00 or 0xD0 <= marker <= 0xD7:  # stuffed byte, restart marker
+                    self._pos = pos + 2
+                elif marker == 0xFF:  # fill byte
+                    self._pos = pos + 1
+                else:
+                    self._pos, self._mode = pos, "header"
+                continue
+            if pos + 2 > n:
+                return -1
+            if buf[pos] != 0xFF:
+                self._mode = "raw"
+                continue
+            marker = buf[pos + 1]
+            if marker == 0xD9:
+                return pos + 2
+            if marker == 0xFF:
+                self._pos = pos + 1
+                continue
+            if marker == 0xD8:  # a new frame begins: the one before it was cut short
+                del buf[:pos]
+                n, self._pos = len(buf), 2
+                continue
+            if marker == 0x01 or 0xD0 <= marker <= 0xD7:  # markers without a length
+                self._pos = pos + 2
+                continue
+            if pos + 4 > n:
+                return -1
+            seg = int.from_bytes(buf[pos + 2:pos + 4], "big")
+            if seg < 2:
+                self._mode = "raw"
+                continue
+            if pos + 2 + seg > n:
+                return -1
+            self._pos = pos + 2 + seg
+            if marker == 0xDA:  # start of scan: entropy-coded data follows
+                self._mode = "scan"
 
 
 class Hub:
@@ -1521,9 +1586,10 @@ class Hub:
         client = Client(ip, mode)
         with self.lock:
             self.clients.add(client)
-            latest = self.latest
-        if latest is not None:
-            client.offer(latest)  # an unchanged screen publishes nothing: show it now
+            # An unchanged screen publishes nothing: show it now. Under the lock, so a
+            # frame published meanwhile is offered after this one and not replaced by it.
+            if self.latest is not None:
+                client.offer(self.latest)
         return client
 
     def remove_client(self, client: "Client") -> None:
@@ -1727,6 +1793,8 @@ class WSClientParser:
                 events.append(("close", payload)); continue
             if opcode == 0x9:
                 events.append(("ping", payload)); continue
+            if opcode == 0xA:
+                continue  # pong: the browser's reply to our keep-alive ping
             if opcode == 0x0:
                 if not self.fragment: raise ValueError("unexpected continuation")
                 self.fragment.extend(payload)
@@ -1842,6 +1910,12 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                 self.end_headers()
                 self.wfile.write(page)
             elif path == "/health":
+                # Which keys were pressed and where the last click landed are for the
+                # Mac and the controlling device only, not for every LAN client.
+                trusted = gate.ok(self.client_address[0])
+                keys = injector.snapshot() if injector else None
+                if keys and not trusted:
+                    keys = {"connections": keys["connections"], "stats": keys["stats"]}
                 body = json.dumps({
                     "frames": hub.frames,
                     "duplicate_frames": hub.duplicates,
@@ -1856,9 +1930,9 @@ def make_handler(hub: Hub, clicker: "Clicker | None" = None,
                     "frame_size": hub.frame_size,
                     "clicks": clicker.stats if clicker else None,
                     "clicks_enabled": clicker is not None,
-                    "last_click": clicker.last_click if clicker else None,
+                    "last_click": clicker.last_click if clicker and trusted else None,
                     "accessibility": accessibility_trusted() if clicker else None,
-                    "input": injector.snapshot() if injector else None,
+                    "input": keys,
                 }).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -2083,11 +2157,20 @@ def dns_responder(sock: socket.socket, answer: str, names: list[str] | None) -> 
     """
     wanted = {n.lower() for n in (names or [])}
     print(f"[dns] answering A queries -> {answer}", flush=True)
+    failures = 0
     while True:
-        data, addr = sock.recvfrom(1500)
-        resp = dns_answer(data, answer, wanted)
-        if resp:
-            sock.sendto(resp, addr)
+        try:
+            data, addr = sock.recvfrom(1500)
+            resp = dns_answer(data, answer, wanted)
+            if resp:
+                sock.sendto(resp, addr)
+            failures = 0
+        except OSError as exc:
+            # a Wi-Fi blip ("No route to host") must not end DNS for good
+            failures += 1
+            if failures == 1:
+                print(f"[dns] {exc}; still answering", flush=True)
+            time.sleep(min(0.05 * failures, 1.0))  # a dead socket must not spin
 
 
 def _qv(quality: int) -> int:
@@ -2382,6 +2465,10 @@ def main() -> int:
     dns_sock = None
     if args.dns_port:
         answer = args.dns_answer or lan_ip
+        try:
+            socket.inet_aton(answer)
+        except OSError:
+            raise SystemExit(f"--dns-answer: {answer!r} is not an IPv4 address")
         dns_bind = args.dns_bind or answer
         dns_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         dns_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
