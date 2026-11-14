@@ -306,10 +306,14 @@ class Tests(unittest.TestCase):
                          b"Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
                          b"Sec-WebSocket-Version: 13\r\n\r\n")
             self.assertIn(b"101", sock.recv(4096))
+            frames = b""
             for t in texts:
                 t = t.encode(); mask = b"\x01\x02\x03\x04"
-                sock.sendall(bytes([0x81, 0x80 | len(t)]) + mask +
-                             bytes(c ^ mask[i % 4] for i, c in enumerate(t)))
+                frames += (bytes([0x81, 0x80 | len(t)]) + mask +
+                           bytes(c ^ mask[i % 4] for i, c in enumerate(t)))
+            # one send: the server hangs up on a bad secret, and writing the
+            # later frames to that closed socket is a broken pipe
+            sock.sendall(frames)
             time.sleep(0.2)
             return sock
         try:
