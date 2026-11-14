@@ -11,10 +11,14 @@ import unittest
 import unittest.mock
 import struct
 import subprocess
+import sys
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 
 import switchdisplay
+
+# a capture that never writes a frame, on any OS
+IDLE = [sys.executable, "-c", "import time; time.sleep(30)"]
 
 
 class Tests(unittest.TestCase):
@@ -402,7 +406,7 @@ class Tests(unittest.TestCase):
             reader.close()
 
     def test_capture_never_reads_the_terminal_and_warns_without_frames(self):
-        hub = switchdisplay.Hub(["sleep", "2"])
+        hub = switchdisplay.Hub(IDLE)
         hub.no_frames_warn_s = 0.05
         with unittest.mock.patch("builtins.print") as printed:
             hub.start()
@@ -419,7 +423,7 @@ class Tests(unittest.TestCase):
         self.assertIn("no frames", " ".join(str(c.args[0]) for c in printed.call_args_list))
 
     def test_second_interrupt_while_stopping_still_kills_capture(self):
-        hub = switchdisplay.Hub(["sleep", "30"])
+        hub = switchdisplay.Hub(IDLE)
         hub.no_frames_warn_s = 30
         hub.start()
         real_wait = hub.proc.wait
@@ -590,7 +594,7 @@ class Tests(unittest.TestCase):
         return condition()
 
     def test_capture_restarts_after_it_exits(self):
-        hub = switchdisplay.Hub(["sh", "-c", "sleep 0.1; exit 3"])
+        hub = switchdisplay.Hub([sys.executable, "-c", "import sys, time; time.sleep(0.1); sys.exit(3)"])
         with unittest.mock.patch("builtins.print") as printed:
             hub.start()
             try:
@@ -600,7 +604,7 @@ class Tests(unittest.TestCase):
         self.assertIn("capture exited (3)", " ".join(str(c.args[0]) for c in printed.call_args_list))
 
     def test_capture_without_frames_is_restarted_when_asked(self):
-        hub = switchdisplay.Hub(["sleep", "30"], restart_stalled=True)
+        hub = switchdisplay.Hub(IDLE, restart_stalled=True)
         hub.no_frames_warn_s = 0.05
         with unittest.mock.patch("builtins.print"):
             hub.start()
@@ -663,12 +667,14 @@ class Tests(unittest.TestCase):
         """Run one tools/viewer_test.js case against the rendered viewer script."""
         page = switchdisplay.render_viewer(True, "s", True, True, tiles=tiles).decode()
         script = page[page.index("<script>") + 8:page.index("</script>")]
-        with tempfile.NamedTemporaryFile("w", suffix=".js") as out:
-            out.write(script)
-            out.flush()
+        # a directory, not NamedTemporaryFile: Windows won't let Node open that one
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "viewer.js")
+            with open(path, "w", encoding="utf-8") as out:
+                out.write(script)
             harness = os.path.join(os.path.dirname(__file__), "..", "tools", "viewer_test.js")
-            run = subprocess.run(["node", harness, name, out.name], capture_output=True,
-                                 text=True, timeout=60)
+            run = subprocess.run([shutil.which("node"), harness, name, path],
+                                 capture_output=True, text=True, timeout=60)
         self.assertEqual(run.returncode, 0, run.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "needs Node.js")
@@ -773,6 +779,177 @@ class Tests(unittest.TestCase):
         finally:
             server.shutdown(); server.server_close()
 
+    def _fake_x11(self):
+        """An X server stand-in: a US-like layout for a few keys, and a call log."""
+        import ctypes
+        calls, state = [], {"pointer": (10, 20), "map": {}}
+        layout = {38: (ord("a"), ord("A")), 25: (ord("w"), ord("W")), 50: (0xFFE1, 0),
+                  36: (0xFF0D, 0), 65: (0x20, 0), 10: (ord("1"), ord("!"))}
+
+        class X:
+            def XKeysymToKeycode(self, dpy, keysym):
+                for code, syms in list(layout.items()) + list(state["map"].items()):
+                    if keysym and keysym in syms:
+                        return code
+                return 0
+
+            def XkbKeycodeToKeysym(self, dpy, code, group, level):
+                return layout.get(code, state["map"].get(code, (0, 0)))[level]
+
+            def XQueryPointer(self, dpy, root, w, child, x, y, wx, wy, mask):
+                x._obj.value, y._obj.value = state["pointer"]
+
+            def XDisplayKeycodes(self, dpy, low, high):
+                low._obj.value, high._obj.value = 8, 255
+
+            def XGetKeyboardMapping(self, dpy, first, count, per):
+                per._obj.value = 2
+                table = [0] * (count * 2)
+                for code, syms in list(layout.items()) + list(state["map"].items()):
+                    table[(code - first) * 2:(code - first) * 2 + 2] = syms
+                return table
+
+            def XChangeKeyboardMapping(self, dpy, code, per, syms, count):
+                calls.append(("map", code, syms[0]))
+                state["map"][code] = (syms[0], 0)
+                if not syms[0]:
+                    del state["map"][code]
+
+            def XFree(self, table): pass
+            def XFlush(self, dpy): pass
+            def XSync(self, dpy, discard): pass
+
+        class XTest:
+            def XTestFakeKeyEvent(self, dpy, code, down, delay):
+                calls.append(("key", code, bool(down)))
+
+            def XTestFakeButtonEvent(self, dpy, button, down, delay):
+                calls.append(("button", button, bool(down)))
+
+            def XTestFakeMotionEvent(self, dpy, screen, x, y, delay):
+                calls.append(("move", x, y))
+                state["pointer"] = (x, y)
+        return SimpleNamespace(x=X(), xt=XTest(), dpy=1, screen=0, root=1,
+                               lock=threading.Lock(), ctypes=ctypes), calls, state
+
+    def test_x11_input_backend(self):
+        q, calls, state = self._fake_x11()
+        code = switchdisplay.MAC_KEYCODES
+        with unittest.mock.patch.object(switchdisplay, "_x11", return_value=q), \
+                unittest.mock.patch.object(switchdisplay, "X11_REMAP_S", 0):
+            switchdisplay.x11_click(300, 200)
+            self.assertEqual(calls, [("move", 300, 200), ("button", 1, True), ("button", 1, False)])
+            del calls[:]
+            switchdisplay.x11_key(code["w"], True)         # keymap names -> this layout's keys
+            switchdisplay.x11_key(code["return"], False)
+            switchdisplay.x11_mouse_button(1, True)        # right button is X button 3
+            self.assertEqual(calls, [("key", 25, True), ("key", 36, False), ("button", 3, True)])
+            with self.assertRaises(OSError):
+                switchdisplay.x11_key(code["slash"], True) # not on the fake layout
+            del calls[:]
+            self.assertEqual(switchdisplay.x11_mouse_move(-500, 7, (0, 0, 800, 600)), (0, 207))
+            self.assertEqual(calls, [("move", 0, 207)])    # clamped to the screen
+            del calls[:]
+            switchdisplay.x11_text("aA€")             # plain, shifted, not on the layout
+            self.assertEqual(calls, [
+                ("key", 38, True), ("key", 38, False),
+                ("key", 50, True), ("key", 38, True), ("key", 38, False), ("key", 50, False),
+                ("map", 255, 0x010020AC), ("key", 255, True), ("key", 255, False),
+                ("map", 255, 0)])                          # the borrowed key is given back
+            self.assertEqual(state["map"], {})
+
+    def test_linux_uses_the_x11_backend(self):
+        with unittest.mock.patch.object(sys, "platform", "linux"), \
+                unittest.mock.patch.object(switchdisplay, "x11_click") as click, \
+                unittest.mock.patch.object(switchdisplay, "accessibility_trusted", return_value=None):
+            clicker = switchdisplay.Clicker("s", (1920, 1080), (0, 0), dry_run=False)
+            self.assertEqual(clicker.click("a", 50, 50, (100, 100))[0], 200)
+            click.assert_called_once_with(960, 540)
+            inj = switchdisplay.KeyInjector({}, dry_run=True)
+            try:
+                self.assertEqual((inj.poster, inj.mover, inj.text_poster),
+                                 (switchdisplay.x11_key, switchdisplay.x11_mouse_move,
+                                  switchdisplay.x11_text))
+            finally:
+                inj.close()
+
+    def test_x11_input_on_a_live_x_server(self):
+        """Against a real X server (CI runs the Linux jobs under Xvfb)."""
+        try:
+            if not sys.platform.startswith("linux") or not os.environ.get("DISPLAY"):
+                raise OSError("needs Linux with DISPLAY set")
+            switchdisplay._x11.cache_clear()
+            q = switchdisplay._x11()
+        except OSError as exc:
+            if os.environ.get("SWITCHDISPLAY_REQUIRE_X11"):
+                raise
+            self.skipTest(str(exc))
+        import ctypes
+        width, height = switchdisplay.x11_screen_size()
+        self.assertGreater(min(width, height), 200)
+        switchdisplay.x11_click(100, 120)
+        self.assertEqual(switchdisplay._x11_pointer(q), (100, 120))
+        self.assertEqual(switchdisplay.x11_mouse_move(5, -3, (0, 0, width, height)), (105, 117))
+        self.assertEqual(switchdisplay.x11_mouse_move(-9999, 0, (0, 0, width, height))[0], 0)
+        self.assertEqual(switchdisplay._x11_pointer(q), (0, 117))
+
+        def held(keycode):                                 # the server's own view of the keys
+            keys = ctypes.create_string_buffer(32)
+            q.x.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            q.x.XQueryKeymap(q.dpy, keys)
+            return bool(keys.raw[keycode // 8] & (1 << (keycode % 8)))
+        w = q.x.XKeysymToKeycode(q.dpy, ord("w"))
+        self.assertTrue(w)
+        switchdisplay.x11_key(switchdisplay.MAC_KEYCODES["w"], True)
+        self.assertTrue(held(w))
+        switchdisplay.x11_key(switchdisplay.MAC_KEYCODES["w"], False)
+        self.assertFalse(held(w))
+        spare = switchdisplay._x11_spare_keycode(q)
+        switchdisplay.x11_text("aB €é")
+        self.assertEqual(switchdisplay._x11_spare_keycode(q), spare)   # given back
+        self.assertFalse(held(spare))
+
+    def test_windows_host_pieces(self):
+        args = SimpleNamespace(source=None, preset="windows", width=960, height=540, fps=15,
+                               quality=65)
+        cmd = switchdisplay.resolve_capture(args)
+        self.assertEqual(cmd[cmd.index("-f") + 1:cmd.index("-f") + 2], ["gdigrab"])
+        self.assertEqual(cmd[cmd.index("-i") + 1], "desktop")
+        args.source = 'cap.exe --title "My Window" -q {qv}'
+        with unittest.mock.patch.object(sys, "platform", "win32"):
+            # the command line as written: no /bin/sh there, and no re-quoting
+            self.assertEqual(switchdisplay.resolve_capture(args), 'cap.exe --title "My Window" -q 11')
+        self.assertEqual(switchdisplay._shown("a b"), "a b")
+
+        class NoSendmsg:                                   # a Windows socket
+            def __init__(self, sock):
+                self.sock = sock
+
+            def send(self, data):
+                return self.sock.send(data[:1000])         # short writes
+
+            def fileno(self):
+                return self.sock.fileno()
+        a, b = socket.socketpair()
+        try:
+            payload = bytes(range(256)) * 20
+            switchdisplay.ws_send_frame(NoSendmsg(a), payload)
+            got = b""
+            while len(got) < len(payload) + 4:
+                got += b.recv(65536)
+            self.assertEqual(got, b"\x82\x7e" + struct.pack(">H", len(payload)) + payload)
+        finally:
+            a.close(); b.close()
+
+        # stopping a capture where killpg and SIGKILL don't exist
+        hub = switchdisplay.Hub(IDLE)
+        hub.no_frames_warn_s = 30
+        hub.start()
+        with unittest.mock.patch.object(switchdisplay.os, "killpg", create=True,
+                                        side_effect=AttributeError):
+            hub.stop()
+        self.assertTrue(self._wait(lambda: hub.proc.poll() is not None))
+
     def test_silent_input_socket_is_pinged_then_closed(self):
         inj = switchdisplay.KeyInjector({}, dry_run=True)
         clicker = switchdisplay.Clicker("sekrit", None, (0, 0), True)
@@ -851,7 +1028,7 @@ class Tests(unittest.TestCase):
             inj.close()
 
     def test_capture_that_stops_sending_frames_is_restarted(self):
-        hub = switchdisplay.Hub(["sleep", "30"], restart_stalled=True)
+        hub = switchdisplay.Hub(IDLE, restart_stalled=True)
         hub.no_frames_warn_s, hub.stall_s = 30, 0.2
         with unittest.mock.patch("builtins.print"):
             hub.start()
