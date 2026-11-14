@@ -519,10 +519,17 @@ class Tests(unittest.TestCase):
                 self.assertEqual(request("POST", "/click", click)[0], 403)
                 self.assertEqual(request("GET", "/input")[0], 403)
                 self.assertEqual(clicker.stats["received"], 0)
+                inj.press(object(), "h", True)             # a key the controller pressed
+                clicker.last_click = {"px": 5, "py": 6}
+                health = json.loads(request("GET", "/health")[1])
+                self.assertEqual(sorted(health["input"]), ["connections", "stats"])
+                self.assertIsNone(health["last_click"])    # not for a view-only device
                 gate.owner = "127.0.0.1"
                 self.assertIn(b"sekrit", request("GET", "/")[1])
                 health = json.loads(request("GET", "/health")[1])
                 self.assertEqual(health["control"]["owner"], "127.0.0.1")
+                self.assertEqual(health["input"]["seen"], {"h": 1})
+                self.assertEqual(health["last_click"], {"px": 5, "py": 6})
         finally:
             server.shutdown(); server.server_close(); inj.close()
 
@@ -598,6 +605,72 @@ class Tests(unittest.TestCase):
             finally:
                 hub.stop()
         self.assertTrue(self._wait(lambda: hub.proc.poll() is not None))
+
+    def test_dns_responder_survives_a_send_error(self):
+        name = b"\x08conntest\x0cnintendowifi\x03net\x00"
+        packet = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + name + b"\x00\x01\x00\x01"
+        sent, done = [], threading.Event()
+
+        class Sock:
+            calls = 0
+
+            def recvfrom(self, _):
+                self.calls += 1
+                if self.calls > 2:
+                    done.set()
+                    time.sleep(60)
+                return packet, ("192.0.2.50", 5353)
+
+            def sendto(self, data, addr):
+                if self.calls == 1:
+                    raise OSError(65, "No route to host")
+                sent.append(addr)
+        with unittest.mock.patch("builtins.print"):
+            threading.Thread(target=switchdisplay.dns_responder,
+                             args=(Sock(), "192.0.2.1", ["conntest.nintendowifi.net"]),
+                             daemon=True).start()
+            self.assertTrue(done.wait(3))
+        self.assertEqual(sent, [("192.0.2.50", 5353)])     # the query after the error
+
+    def test_new_viewer_is_not_left_on_a_frame_older_than_the_latest(self):
+        hub = switchdisplay.Hub([])
+        frame = lambda tag: b"\xff\xd8" + tag * 64 + b"\xff\xd9"
+        hub._publish(frame(b"a"))
+        offer, publisher = switchdisplay.Client.offer, []
+
+        def racing_offer(client, data):
+            if not publisher:                              # the capture publishes meanwhile
+                publisher.append(threading.Thread(target=hub._publish, args=(frame(b"b"),)))
+                publisher[0].start()
+                time.sleep(0.2)
+            offer(client, data)
+        with unittest.mock.patch.object(switchdisplay.Client, "offer", racing_offer):
+            client = hub.add_client()
+            publisher[0].join()
+        try:
+            self.assertEqual(client.queue.get_nowait(), frame(b"b"))
+        finally:
+            hub.remove_client(client)
+
+    def test_websocket_pong_is_ignored(self):
+        pong = bytes([0x8A, 0x80]) + b"abcd"
+        self.assertEqual(switchdisplay.WSClientParser().feed(pong), [])
+
+    def test_frame_splitter_skips_end_markers_inside_header_segments(self):
+        def segment(marker, payload):
+            return bytes([0xFF, marker]) + struct.pack(">H", len(payload) + 2) + payload
+        scan = b"\x12\xff\x00\x34\xff\xd0\x56"            # stuffed byte, restart marker
+        jpeg = (b"\xff\xd8" + segment(0xE1, b"thumb\xff\xd8..\xff\xd9") +
+                segment(0xFE, b"\xff\xd9") + segment(0xDA, b"\x01\x02") + scan + b"\xff\xd9")
+        stream = b"junk" + jpeg + jpeg
+        for size in (1, 3, len(stream)):
+            splitter = switchdisplay.JpegStreamSplitter()
+            frames = [f for i in range(0, len(stream), size)
+                      for f in splitter.feed(stream[i:i + size])]
+            self.assertEqual(frames, [jpeg, jpeg], size)
+        # a frame cut short by a capture restart is dropped, not glued to the next one
+        splitter = switchdisplay.JpegStreamSplitter()
+        self.assertEqual(list(splitter.feed(jpeg[:-6] + jpeg)), [jpeg])
 
 
 
