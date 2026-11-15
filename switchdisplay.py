@@ -994,6 +994,214 @@ def quartz_text(text: str) -> None:
         time.sleep(0.01)
 
 
+# ---- Linux input: X11 through the XTest extension (ctypes, like CoreGraphics above) ----
+# Reaches X11 sessions and XWayland apps. Native Wayland apps ignore XTest events.
+
+# Keymap targets -> X keysyms. The keycode is looked up per keyboard layout.
+X11_KEYSYMS = {
+    **{c: ord(c) for c in "abcdefghijklmnopqrstuvwxyz0123456789"},
+    "minus": 0x2D, "equal": 0x3D, "bracketleft": 0x5B, "bracketright": 0x5D,
+    "semicolon": 0x3B, "quote": 0x27, "comma": 0x2C, "period": 0x2E, "slash": 0x2F,
+    "backslash": 0x5C, "grave": 0x60,
+    "return": 0xFF0D, "tab": 0xFF09, "space": 0x20, "delete": 0xFF08, "escape": 0xFF1B,
+    "shift": 0xFFE1, "ctrl": 0xFFE3, "option": 0xFFE9,  # Shift_L, Control_L, Alt_L
+    "left": 0xFF51, "up": 0xFF52, "right": 0xFF53, "down": 0xFF54,
+}
+_MAC_KEY_NAMES = {code: name for name, code in MAC_KEYCODES.items()}
+X11_DISPLAY: list = [None]  # the X display to act on; None means $DISPLAY
+
+
+def _linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+@functools.lru_cache(maxsize=1)
+def _x11():
+    """Xlib and XTest via ctypes, with an open display. OSError says why not."""
+    import ctypes
+    import ctypes.util
+    try:
+        x = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+        xt = ctypes.CDLL(ctypes.util.find_library("Xtst") or "libXtst.so.6")
+    except OSError as exc:
+        raise OSError(f"X11 libraries not found ({exc}); install libx11-6 and libxtst6") from exc
+    c_int, c_uint, c_ulong, c_void_p = ctypes.c_int, ctypes.c_uint, ctypes.c_ulong, ctypes.c_void_p
+    int_p, ulong_p = ctypes.POINTER(c_int), ctypes.POINTER(c_ulong)
+    for lib, name, restype, argtypes in (
+            (x, "XInitThreads", c_int, []),
+            (x, "XOpenDisplay", c_void_p, [ctypes.c_char_p]),
+            (x, "XDefaultScreen", c_int, [c_void_p]),
+            (x, "XDefaultRootWindow", c_ulong, [c_void_p]),
+            (x, "XDisplayWidth", c_int, [c_void_p, c_int]),
+            (x, "XDisplayHeight", c_int, [c_void_p, c_int]),
+            (x, "XQueryPointer", c_int, [c_void_p, c_ulong, ulong_p, ulong_p, int_p, int_p,
+                                         int_p, int_p, ctypes.POINTER(c_uint)]),
+            (x, "XKeysymToKeycode", ctypes.c_ubyte, [c_void_p, c_ulong]),
+            (x, "XkbKeycodeToKeysym", c_ulong, [c_void_p, ctypes.c_ubyte, c_int, c_int]),
+            (x, "XDisplayKeycodes", c_int, [c_void_p, int_p, int_p]),
+            (x, "XGetKeyboardMapping", ulong_p, [c_void_p, ctypes.c_ubyte, c_int, int_p]),
+            (x, "XChangeKeyboardMapping", c_int, [c_void_p, c_int, c_int, ulong_p, c_int]),
+            (x, "XFree", c_int, [c_void_p]),
+            (x, "XFlush", c_int, [c_void_p]),
+            (x, "XSync", c_int, [c_void_p, c_int]),
+            (x, "XSetErrorHandler", c_void_p, [c_void_p]),
+            (xt, "XTestQueryExtension", c_int, [c_void_p, int_p, int_p, int_p, int_p]),
+            (xt, "XTestFakeKeyEvent", c_int, [c_void_p, c_uint, c_int, c_ulong]),
+            (xt, "XTestFakeButtonEvent", c_int, [c_void_p, c_uint, c_int, c_ulong]),
+            (xt, "XTestFakeMotionEvent", c_int, [c_void_p, c_int, c_int, c_int, c_ulong])):
+        function = getattr(lib, name)
+        function.restype, function.argtypes = restype, argtypes
+    x.XInitThreads()
+    name = X11_DISPLAY[0] or os.environ.get("DISPLAY")
+    dpy = x.XOpenDisplay(name.encode() if name else None)
+    if not dpy:
+        raise OSError(f"cannot open X display {name or '(DISPLAY is not set)'}")
+    unused = c_int()
+    if not xt.XTestQueryExtension(dpy, unused, unused, unused, unused):
+        raise OSError("the X server has no XTest extension")
+    # Xlib's default handler ends the process on any protocol error
+    handler = ctypes.CFUNCTYPE(c_int, c_void_p, c_void_p)(lambda display, event: 0)
+    x.XSetErrorHandler(handler)
+    return SimpleNamespace(x=x, xt=xt, dpy=dpy, screen=x.XDefaultScreen(dpy),
+                           root=x.XDefaultRootWindow(dpy), lock=threading.Lock(),
+                           ctypes=ctypes, handler=handler)
+
+
+def x11_screen_size() -> tuple[int, int] | None:
+    """The X screen's size in pixels, or None when there is no usable X display."""
+    try:
+        q = _x11()
+    except OSError:
+        return None
+    with q.lock:
+        return (q.x.XDisplayWidth(q.dpy, q.screen), q.x.XDisplayHeight(q.dpy, q.screen))
+
+
+def _x11_pointer(q) -> tuple[int, int]:
+    c = q.ctypes
+    window, child, mask = c.c_ulong(), c.c_ulong(), c.c_uint()
+    x, y, wx, wy = c.c_int(), c.c_int(), c.c_int(), c.c_int()
+    q.x.XQueryPointer(q.dpy, q.root, c.byref(window), c.byref(child), c.byref(x), c.byref(y),
+                      c.byref(wx), c.byref(wy), c.byref(mask))
+    return x.value, y.value
+
+
+def x11_click(px: int, py: int) -> None:
+    """One left click at (px, py) on the X screen."""
+    q = _x11()
+    with q.lock:
+        q.xt.XTestFakeMotionEvent(q.dpy, q.screen, int(px), int(py), 0)
+        q.xt.XTestFakeButtonEvent(q.dpy, 1, True, 0)
+        q.xt.XTestFakeButtonEvent(q.dpy, 1, False, 0)
+        q.x.XFlush(q.dpy)
+
+
+def x11_key(code: int, down: bool) -> None:
+    """Press or release a key, named by its MAC_KEYCODES value like quartz_key."""
+    q = _x11()
+    keysym = X11_KEYSYMS.get(_MAC_KEY_NAMES.get(code))
+    with q.lock:
+        keycode = q.x.XKeysymToKeycode(q.dpy, keysym) if keysym else 0
+        if not keycode:
+            raise OSError("this keyboard layout has no such key")
+        q.xt.XTestFakeKeyEvent(q.dpy, keycode, down, 0)
+        q.x.XFlush(q.dpy)
+
+
+def x11_mouse_button(button: int, down: bool) -> None:
+    """Press or release a mouse button (0 left, 1 right) where the pointer is."""
+    q = _x11()
+    with q.lock:
+        q.xt.XTestFakeButtonEvent(q.dpy, 1 if button == 0 else 3, down, 0)
+        q.x.XFlush(q.dpy)
+
+
+def x11_mouse_move(dx: int, dy: int, bounds: tuple[int, int, int, int] | None,
+                   kind: int = 0, button: int = 0) -> tuple[float, float]:
+    """Move the pointer by (dx, dy) inside bounds. X turns it into a drag by itself
+    while a button is held, so kind and button (needed on macOS) are unused."""
+    q = _x11()
+    with q.lock:
+        x, y = _x11_pointer(q)
+        x, y = x + dx, y + dy
+        if bounds:
+            bx, by, bw, bh = bounds
+            x, y = min(max(x, bx), bx + bw - 1), min(max(y, by), by + bh - 1)
+        q.xt.XTestFakeMotionEvent(q.dpy, q.screen, x, y, 0)
+        q.x.XFlush(q.dpy)
+    return x, y
+
+
+def _x11_keysym(char: str) -> int:
+    """Latin-1 characters are their own keysym; the rest use the Unicode range."""
+    point = ord(char)
+    return point if 0x20 <= point <= 0x7E or 0xA0 <= point <= 0xFF else 0x01000000 | point
+
+
+def _x11_spare_keycode(q) -> int:
+    """A keycode with nothing on it, to borrow for characters the layout lacks."""
+    c = q.ctypes
+    low, high, per = c.c_int(), c.c_int(), c.c_int()
+    q.x.XDisplayKeycodes(q.dpy, c.byref(low), c.byref(high))
+    count = high.value - low.value + 1
+    table = q.x.XGetKeyboardMapping(q.dpy, low.value, count, c.byref(per))
+    if not table:
+        raise OSError("cannot read the X keyboard mapping")
+    try:
+        for index in range(count - 1, -1, -1):
+            if not any(table[index * per.value + i] for i in range(per.value)):
+                return low.value + index
+    finally:
+        q.x.XFree(table)
+    raise OSError("no spare keycode on this keyboard for typing text")
+
+
+def x11_text(text: str) -> None:
+    """Type text into the focused window.
+
+    A character the layout has is typed with its own key (and Shift if it sits
+    on the shifted level). Any other is put on a spare keycode for a moment,
+    the way xdotool does it.
+    """
+    q = _x11()
+    c = q.ctypes
+
+    def remap(keycode: int, keysym: int) -> None:
+        q.x.XChangeKeyboardMapping(q.dpy, keycode, 1, (c.c_ulong * 1)(keysym), 1)
+        q.x.XSync(q.dpy, False)
+        time.sleep(X11_REMAP_S)  # applications have to take in the new mapping first
+
+    with q.lock:
+        shift = q.x.XKeysymToKeycode(q.dpy, X11_KEYSYMS["shift"])
+        spare = None
+        try:
+            for char in text:
+                keysym = _x11_keysym(char)
+                keycode = q.x.XKeysymToKeycode(q.dpy, keysym)
+                level = next((l for l in (0, 1) if keycode and keycode != spare
+                              and q.x.XkbKeycodeToKeysym(q.dpy, keycode, 0, l) == keysym), None)
+                if level is None:
+                    if spare is None:
+                        spare = _x11_spare_keycode(q)
+                    remap(spare, keysym)
+                    keycode, level = spare, 0
+                if level and shift:
+                    q.xt.XTestFakeKeyEvent(q.dpy, shift, True, 0)
+                q.xt.XTestFakeKeyEvent(q.dpy, keycode, True, 0)
+                q.xt.XTestFakeKeyEvent(q.dpy, keycode, False, 0)
+                if level and shift:
+                    q.xt.XTestFakeKeyEvent(q.dpy, shift, False, 0)
+                q.x.XSync(q.dpy, False)
+                if keycode == spare:
+                    time.sleep(X11_REMAP_S)  # before the key is borrowed for the next one
+        finally:
+            if spare is not None:
+                remap(spare, 0)
+
+
+X11_REMAP_S = 0.02
+
+
 def _frontmost_pid() -> int | None:
     """The frontmost app's pid. lsappinfo, as NSWorkspace goes stale without a run loop."""
     try:
@@ -1086,13 +1294,14 @@ class KeyInjector:
         self.keymap = keymap
         self.dry_run = dry_run
         self.hold_s = hold_s
-        self.poster = poster or quartz_key
-        self.button_poster = button_poster or quartz_mouse_button
-        self.mover = mover or quartz_mouse_move
+        self.poster = poster or (x11_key if _linux() else quartz_key)
+        self.button_poster = button_poster or (x11_mouse_button if _linux()
+                                               else quartz_mouse_button)
+        self.mover = mover or (x11_mouse_move if _linux() else quartz_mouse_move)
         self.bounds = bounds
         self.last_pointer: tuple[float, float] | None = None
         self.text_enabled = text_enabled
-        self.text_poster = text_poster or quartz_text
+        self.text_poster = text_poster or (x11_text if _linux() else quartz_text)
         self.focus_check = focus_check or focused_text_field
         self.focus_delay_s = focus_delay_s
         self._sockets: dict[socket.socket, threading.Lock] = {}
@@ -1432,7 +1641,7 @@ class Clicker:
             return 503, {"error": "Accessibility permission missing", "fix": ACCESSIBILITY_HELP}
         else:
             try:
-                quartz_click(px, py)
+                (x11_click if _linux() else quartz_click)(px, py)
                 result = "clicked"
             except OSError as exc:
                 with self._lock:
@@ -1755,18 +1964,20 @@ class Hub:
     def _terminate(proc: subprocess.Popen) -> None:
         if proc.poll() is not None:
             return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except OSError:
-            proc.terminate()
+
+        def signal_group(name: str, fallback) -> None:
+            # the capture's whole session, so a shell's children go too; Windows
+            # has neither process groups of this kind nor these signals
+            try:
+                os.killpg(proc.pid, getattr(signal, name))
+            except (AttributeError, OSError):
+                fallback()
+        signal_group("SIGTERM", proc.terminate)
         try:
             proc.wait(timeout=3)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
             # a second Ctrl-C while waiting must not leave the capture running
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except OSError:
-                proc.kill()
+            signal_group("SIGKILL", proc.kill)
 
     def stop(self) -> None:
         self._stopping.set()
@@ -1875,7 +2086,10 @@ def ws_send_frame(sock: socket.socket, payload: bytes, opcode: int = 0x2) -> Non
         header.append(127)
         header += struct.pack(">Q", n)
     header = bytes(header)
-    parts = [memoryview(header), memoryview(payload)]
+    if hasattr(sock, "sendmsg"):
+        parts, send = [memoryview(header), memoryview(payload)], sock.sendmsg
+    else:  # Windows has no sendmsg: one buffer, sent piece by piece
+        parts, send = [memoryview(header + payload)], lambda bufs: sock.send(bufs[0])
     deadline = time.monotonic() + 10.0
 
     def wait_writable() -> None:
@@ -1895,7 +2109,7 @@ def ws_send_frame(sock: socket.socket, payload: bytes, opcode: int = 0x2) -> Non
 
     while parts:
         try:
-            sent = sock.sendmsg(parts)
+            sent = send(parts)
         except (BlockingIOError, InterruptedError):
             wait_writable()
             continue
@@ -2445,9 +2659,24 @@ def x11_capture_cmd(display: str, width: int, height: int, fps: int, quality: in
     ]
 
 
+def windows_capture_cmd(width: int, height: int, fps: int, quality: int,
+                        sharp: bool = False, stretch: bool = False, gray: bool = False,
+                        tiles: tuple[int, int] | None = None) -> list[str]:
+    """Windows: the whole desktop through GDI -> MJPEG on stdout."""
+    return [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "gdigrab", "-framerate", str(fps), "-draw_mouse", "1", "-i", "desktop",
+        "-vf", _scale_filter(width, height, sharp, stretch, gray, tiles),
+        *(["-fps_mode", "passthrough"] if tiles else []),
+        "-pix_fmt", "yuvj420p", "-huffman", "optimal",
+        "-c:v", "mjpeg", "-q:v", str(_qv(quality)), "-f", "mjpeg", "-",
+    ]
+
+
 PRESETS = {
     # name: (default width, height, fps)
     "test": (960, 540, 20),
+    "windows": (960, 540, 15),
     "mac-mirror": (960, 540, 15),
     "mac-extended": (1280, 720, 15),
     "x11": (960, 540, 20),
@@ -2458,8 +2687,12 @@ PROFILES = {"sharp": (1280, 720), "balanced": (960, 540), "low": (800, 450),
             "text": (1280, 648)}
 
 
-def resolve_capture(args) -> list[str]:
-    """Turn CLI flags into the capture argv (or a shell command)."""
+def resolve_capture(args) -> "list[str] | str":
+    """Turn CLI flags into the capture argv (or a shell command).
+
+    On Windows a --source is returned as the command line itself: there is no
+    /bin/sh, and quoting it again for cmd.exe would mangle its own quotes.
+    """
     if args.source:
         tiles = getattr(args, "tiles", None)
         values = {"{w}": str(args.width), "{h}": str(args.height), "{fps}": str(args.fps),
@@ -2468,7 +2701,7 @@ def resolve_capture(args) -> list[str]:
         source = args.source
         for key, value in values.items():
             source = source.replace(key, value)
-        return ["/bin/sh", "-c", source]
+        return source if sys.platform == "win32" else ["/bin/sh", "-c", source]
     preset = args.preset or "test"
     quality = args.quality
     gray, tiles = getattr(args, "gray", False), getattr(args, "tiles", None)
@@ -2478,11 +2711,20 @@ def resolve_capture(args) -> list[str]:
         return mac_capture_cmd(f"Capture screen {_mac_screen(args)}", args.width, args.height, args.fps, quality,
                                getattr(args, "profile", None) == "text",
                                getattr(args, "fill", "fit") == "stretch", gray, tiles)
+    if preset == "windows":
+        return windows_capture_cmd(args.width, args.height, args.fps, quality,
+                                   getattr(args, "profile", None) == "text",
+                                   getattr(args, "fill", "fit") == "stretch", gray, tiles)
     if preset == "x11":
         return x11_capture_cmd(args.display, args.width, args.height, args.fps, quality,
                                getattr(args, "profile", None) == "text",
                                getattr(args, "fill", "fit") == "stretch", gray, tiles)
     raise SystemExit(f"unknown preset: {preset}")
+
+
+def _shown(cmd) -> str:
+    """A capture command for the log: an argv list, or a Windows command line."""
+    return cmd if isinstance(cmd, str) else shlex.join(cmd)
 
 
 def _mac_screen(args) -> int:
@@ -2552,7 +2794,8 @@ def main() -> int:
                     help="HTTP bind address (default 0.0.0.0, or the LAN address with "
                          "--switch or --click-secret)")
     ap.add_argument("--preset", choices=sorted(PRESETS), default=None,
-                     help="capture preset: test | mac-mirror | mac-extended | x11 (default test)")
+                     help="capture preset: test | mac-mirror | mac-extended | x11 | windows "
+                          "(default test)")
     ap.add_argument("--profile", choices=sorted(PROFILES), default=None,
                      help="size profile: sharp 1280x720, balanced 960x540, low 800x450, or text: "
                           "sized for the Switch viewer with better scaling and quality 85, "
@@ -2659,7 +2902,7 @@ def main() -> int:
 
     cmd = resolve_capture(args)
     if args.print_source:
-        print(shlex.join(cmd))
+        print(_shown(cmd))
         return 0
     if not args.source and args.preset in ("mac-mirror", "mac-extended"):
         # otherwise ffmpeg fails on "Capture screen N" and is restarted forever
@@ -2683,8 +2926,14 @@ def main() -> int:
             socketserver.TCPServer.server_bind(self)
     secret = args.click_secret or os.environ.get("SWITCHDISPLAY_SECRET") or ""
     clicker = None
+    if _linux():  # input goes to the display that is captured, else to $DISPLAY
+        X11_DISPLAY[0] = args.display if args.preset == "x11" and not args.source else None
     if secret:
         size, origin = args.click_display_size, args.click_display_origin
+        if size is None and _linux():
+            size = x11_screen_size()
+            if size:
+                print(f"[click] X screen: {size[0]}x{size[1]} pixels (auto-detected)", flush=True)
         screen = _mac_screen(args) if args.preset in ("mac-mirror", "mac-extended") else None
         if screen is not None and size is None:
             match = [d for d in mac_displays() if d["screen"] == screen]
@@ -2746,7 +2995,7 @@ def main() -> int:
     except OSError as exc:
         raise SystemExit(_bind_help("HTTP", args.bind, args.port, exc))
     server.daemon_threads = True
-    if os.geteuid() == 0 and os.environ.get("SUDO_UID"):
+    if hasattr(os, "geteuid") and os.geteuid() == 0 and os.environ.get("SUDO_UID"):
         uid, gid = int(os.environ["SUDO_UID"]), int(os.environ.get("SUDO_GID", "0"))
         try:
             os.setgroups([])
@@ -2759,7 +3008,8 @@ def main() -> int:
         hub.start()
     except OSError as exc:
         raise SystemExit(f"cannot start the capture command ({exc}). The presets need ffmpeg: "
-                         "brew install ffmpeg (macOS) or your package manager (Linux).")
+                         "brew install ffmpeg (macOS), your package manager (Linux) or "
+                         "winget install ffmpeg (Windows).")
     if dns_sock:
         threading.Thread(target=dns_responder,
                          args=(dns_sock, answer,
@@ -2774,7 +3024,7 @@ def main() -> int:
         print(f"[http] {lan_ip} was picked as this machine's LAN address. If the Switch is on "
               "another network (a VPN can take over the default route), pass --bind IP "
               "--dns-answer IP.", flush=True)
-    print(f"[src ] {shlex.join(cmd)}", flush=True)
+    print(f"[src ] {_shown(cmd)}", flush=True)
     if args.tiles:
         print(f"[src ] tiles {args.tiles[0]}x{args.tiles[1]}: only changed tiles are sent "
               "(WebSocket viewer only)", flush=True)
@@ -2790,6 +3040,18 @@ def main() -> int:
         else:
             print("[lock] the first device to open the viewer becomes the only one that can "
                   "control this machine (others are view-only)", flush=True)
+        if not clicker.dry_run and _linux():
+            try:
+                _x11()
+                if os.environ.get("XDG_SESSION_TYPE") == "wayland":
+                    print("[click] note: this is a Wayland session. Input goes through X11, "
+                          "so only XWayland applications will react to it.", flush=True)
+            except OSError as exc:
+                print(f"[click] warning: input will be refused: {exc}. It needs an X11 "
+                      "session (or XWayland) with the XTest extension.", flush=True)
+        elif not clicker.dry_run and sys.platform != "darwin":
+            print("[click] warning: clicks, keys and text are implemented on macOS and "
+                  "Linux/X11 only; here they will be refused (viewing works).", flush=True)
         if not clicker.dry_run and accessibility_trusted(prompt=True) is False:
             print(f"[click] warning: taps will be refused until you {ACCESSIBILITY_HELP}. "
                   "macOS has been asked to show its permission prompt.", flush=True)
@@ -2809,7 +3071,8 @@ def main() -> int:
     def _terminate(signum, frame):
         raise KeyboardInterrupt  # run the finally below: ffmpeg is in its own session
     signal.signal(signal.SIGTERM, _terminate)
-    signal.signal(signal.SIGHUP, _terminate)
+    if hasattr(signal, "SIGHUP"):  # not on Windows
+        signal.signal(signal.SIGHUP, _terminate)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -2823,7 +3086,8 @@ def main() -> int:
 
 def _bind_help(what: str, addr: str, port: int, exc: OSError) -> str:
     hint = ""
-    if isinstance(exc, PermissionError) or (port < 1024 and os.geteuid() != 0):
+    if hasattr(os, "geteuid") and (isinstance(exc, PermissionError)
+                                    or (port < 1024 and os.geteuid() != 0)):
         hint = " Ports below 1024 need sudo."
     return f"cannot bind {what} to {addr}:{port} ({exc.strerror or exc}).{hint}"
 

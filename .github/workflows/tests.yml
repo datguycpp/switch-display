@@ -20,12 +20,22 @@ jobs:
           - {os: ubuntu-24.04, python: "3.9"}
           - {os: ubuntu-latest, python: "3.13"}
           - {os: macos-latest, python: "3.13"}
+          # viewing only on Windows; real screen capture is not exercised here
+          - {os: windows-latest, python: "3.13"}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m unittest discover -s tests -v
+      # Linux input goes through X11: run under a virtual X server so the XTest
+      # code is exercised against a real one (the test must not be skipped here)
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libx11-6 libxtst6
+          SWITCHDISPLAY_REQUIRE_X11=1 xvfb-run -a python -m unittest discover -s tests -v
+      - if: runner.os != 'Linux'
+        run: python -m unittest discover -s tests -v
 
   viewer-es5:
     runs-on: ubuntu-latest

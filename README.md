@@ -1,8 +1,9 @@
 # switchdisplay — a second display on a stock Nintendo Switch
 
-A stock Switch as a wireless second display for a Mac or Linux host, using
-nothing but the console's built-in browser. Optional tap-to-click, Joy-Con
-control and Switch-keyboard text entry send input back to the Mac.
+A stock Switch as a wireless second display for a Mac, Linux or Windows host,
+using nothing but the console's built-in browser. Optional tap-to-click, Joy-Con
+control and Switch-keyboard text entry send input back to a Mac or a Linux/X11
+host.
 
 **Short answer:** it works. The Switch's captive-portal browser cannot play
 video, but it can do WebSocket + canvas + JPEG images — and that is all a
@@ -60,7 +61,7 @@ iGPUs). That is a real low-latency stream with input, but requires Atmosphère +
 hbmenu with title redirection for full RAM. Only worth it if the browser route
 proves too slow.
 
-## 3. Host side: macOS first, Linux second
+## 3. Host side: macOS first, Linux and Windows second
 
 | Option | State |
 |---|---|
@@ -70,7 +71,7 @@ proves too slow.
 | macOS Screen Sharing (VNC 5900) | works, but needs a browser VNC client; noVNC is ES6-module based and will not parse on WebKit 601.6 |
 | VNC + noVNC | needs WebSocket + canvas → capability-compatible, but heavier than needed for a passive second screen |
 | **Sunshine (macOS host) + Moonlight-NX** | real low-latency streaming with input, VideoToolbox H.264; Moonlight-NX is **Switch homebrew** → needs modding |
-| **this prototype** | WebSocket + JPEG + canvas, the smallest capability set that matches the Switch; runs on macOS and Linux |
+| **this prototype** | WebSocket + JPEG + canvas, the smallest capability set that matches the Switch; runs on macOS, Linux and Windows (viewing only there) |
 
 Recommendation: for a *passive* second screen (docs, logs, dashboards) use this
 prototype. For interactive/low-latency use, Sunshine + Moonlight-NX (modded).
@@ -108,8 +109,51 @@ sudo python3 switchdisplay.py --preset mac-extended --screen 1 \
 ```
 
 Presets: `test` (built-in pattern, default), `mac-mirror`, `mac-extended`,
-`x11`. `--print-source` prints the resolved ffmpeg argv without starting the
+`x11`, `windows`. `--print-source` prints the resolved ffmpeg argv without starting the
 server — use it to confirm the capture line before running.
+
+### Linux host (X11)
+
+```bash
+sudo -E python3 switchdisplay.py --switch --preset x11 \
+  --click-secret=... --keys --text
+```
+
+Tap-to-click, `--keys` and `--text` work on Linux through the X server's XTest
+extension, called with `ctypes` like CoreGraphics on the Mac (it needs `libX11`
+and `libXtst`, which a desktop install has). The screen size for mapping taps is
+read from the X server, and the keymap's key names are looked up on the current
+keyboard layout. Differences from the Mac:
+
+* **Wayland:** input reaches X11 sessions and XWayland applications. Native
+  Wayland applications ignore it; the server says so at startup.
+* **Text:** a character the layout has is typed with its own key. Any other is
+  put on a spare keycode for a moment, the way `xdotool` does it, which adds
+  about 40 ms per such character.
+* **No keyboard prompt on focus:** clicking a text field does not open the Switch
+  keyboard by itself; press **-** or tap **kbd**.
+* **Under `sudo`,** keep `DISPLAY` and `XAUTHORITY` (`sudo -E`), or the server
+  cannot open the display after it drops privileges.
+
+CI runs this against a virtual X server (Xvfb): pointer position, key state and
+the text path. It has not been tried on a real Linux desktop.
+
+### Windows host (viewing only)
+
+```
+python switchdisplay.py --switch --preset windows
+```
+
+`--preset windows` captures the whole desktop with ffmpeg's `gdigrab` (install
+ffmpeg with `winget install ffmpeg`). Ports 80 and 53 need no `sudo` there, though
+Windows Firewall will ask to allow Python on the network. `--tiles`, `--gray` and
+the profiles work as on the other hosts. Not available on Windows: tap-to-click,
+`--keys` and `--text` (they are implemented for macOS and Linux/X11), and picking one
+monitor (the capture is the full virtual desktop). A custom `--source` is run as
+written, without a shell, so pipes and `&&` are not available in it.
+
+The unit tests run on Windows in CI, but the capture itself has not been tried on
+a Windows machine.
 
 ### Streaming efficiency profiles
 
