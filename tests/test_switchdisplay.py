@@ -21,6 +21,11 @@ import switchdisplay
 IDLE = [sys.executable, "-c", "import time; time.sleep(30)"]
 
 
+def shell_line(cmd):
+    """The command a --source resolved to: the last argv item, or all of it on Windows."""
+    return cmd if isinstance(cmd, str) else cmd[-1]
+
+
 class Tests(unittest.TestCase):
     def test_jpeg_size(self):
         data = b"\xff\xd8\xff\xc0\x00\x11\x08\x02\x1c\x03\xc0" + b"\xff\xd9"
@@ -59,7 +64,7 @@ class Tests(unittest.TestCase):
     def test_source_placeholders(self):
         args = SimpleNamespace(source="echo {w} {h} {fps} {q} {qv}", width=2, height=3,
                                 fps=4, quality=65, preset=None)
-        self.assertEqual(switchdisplay.resolve_capture(args)[2], "echo 2 3 4 65 11")
+        self.assertEqual(shell_line(switchdisplay.resolve_capture(args)), "echo 2 3 4 65 11")
 
     def test_encoder_flags(self):
         cmd = switchdisplay.default_capture_cmd(960, 540, 20, 65)
@@ -705,7 +710,7 @@ class Tests(unittest.TestCase):
         args.tiles = None
         self.assertNotIn("-vf", switchdisplay.resolve_capture(args))
         args.source, args.tiles = "cap -vf untile={tiles}", (2, 2)
-        self.assertEqual(switchdisplay.resolve_capture(args)[-1], "cap -vf untile=2x2")
+        self.assertEqual(shell_line(switchdisplay.resolve_capture(args)), "cap -vf untile=2x2")
         self.assertEqual(switchdisplay._parse_grid("4x4"), (4, 4))
         for bad in ("1x1", "9x2", "4"):
             with self.assertRaises(Exception):
@@ -749,11 +754,12 @@ class Tests(unittest.TestCase):
                          bytes(c ^ mask[i % 4] for i, c in enumerate(text)))
 
         def message(sock):                                 # one unfragmented server frame
-            head = sock.recv(2, socket.MSG_WAITALL)
-            data = b""
-            while len(data) < head[1]:
-                data += sock.recv(head[1] - len(data))
-            return data
+            def exactly(count):                            # no MSG_WAITALL on Windows
+                data = b""
+                while len(data) < count:
+                    data += sock.recv(count - len(data))
+                return data
+            return exactly(exactly(2)[1])
         try:
             conn = http.client.HTTPConnection("127.0.0.1", server.server_port)
             conn.request("GET", "/mjpeg")
